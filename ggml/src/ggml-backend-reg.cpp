@@ -66,6 +66,10 @@
 #include "ggml-blas.h"
 #endif
 
+#ifdef GGML_USE_XTC
+#include "ggml-xtc.h"
+#endif
+
 #ifdef GGML_USE_RPC
 #include "ggml-rpc.h"
 #endif
@@ -167,6 +171,9 @@ struct ggml_backend_registry {
 #endif
 #ifdef GGML_USE_ET
         register_backend(ggml_backend_et_reg());
+#endif
+#ifdef GGML_USE_XTC
+        register_backend(ggml_backend_xtc_reg());
 #endif
 #ifdef GGML_USE_CPU
         register_backend(ggml_backend_cpu_reg());
@@ -576,6 +583,7 @@ void ggml_backend_load_all_from_path(const char * dir_path) {
 #endif
 
     ggml_backend_load_best("blas", silent, dir_path);
+    ggml_backend_load_best("xtc", silent, dir_path);
     ggml_backend_load_best("zendnn", silent, dir_path);
     ggml_backend_load_best("cann", silent, dir_path);
     ggml_backend_load_best("cuda", silent, dir_path);
