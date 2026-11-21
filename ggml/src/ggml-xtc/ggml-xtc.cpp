@@ -145,11 +145,14 @@ static std::string ggml_xtc_sha256_hex(const std::string & msg) {
 //   MATMUL_F16     F16 A and B (B stored (k,n) as is), F32 output
 //   ADD / MUL      C[m,n] = A[m,n] (+|*) B[m,n], F32
 //   FMA            D[m,n] = A[m,n] * B[m,n] + C[m,n], F32
-//   RSQRT / SILU   C[m,n] = 1/sqrt(A[m,n]) or A[m,n] / (1 + exp(-A[m,n])), F32
+//   RSQRT / SILU / EXP   C[m,n] = 1/sqrt(A[m,n]), A[m,n] / (1 + exp(-A[m,n])) or exp(A[m,n]), F32
+//   REDUCE_MAX / SUM     C[m] = max or sum over n of A[m,n], F32
+//   SUB_ROW / DIV_ROW    C[m,n] = A[m,n] (-|/) B[m], F32
 //   CAST_F16       C[m,n] = F16(A[m,n]), A F32 (round to nearest even)
 enum ggml_xtc_kop {
     XTC_KOP_MATMUL, XTC_KOP_MATMUL_F16_BT, XTC_KOP_MATMUL_F16, XTC_KOP_ADD, XTC_KOP_MUL, XTC_KOP_FMA,
-    XTC_KOP_RSQRT, XTC_KOP_SILU, XTC_KOP_CAST_F16,
+    XTC_KOP_RSQRT, XTC_KOP_SILU, XTC_KOP_CAST_F16, XTC_KOP_EXP,
+    XTC_KOP_REDUCE_MAX, XTC_KOP_REDUCE_SUM, XTC_KOP_SUB_ROW, XTC_KOP_DIV_ROW,
 };
 
 struct ggml_xtc_kernel_shape {
@@ -168,6 +171,11 @@ static const char * ggml_xtc_op_name(ggml_xtc_kop kop) {
         case XTC_KOP_RSQRT: return "rsqrt";
         case XTC_KOP_SILU: return "silu";
         case XTC_KOP_CAST_F16: return "cast";
+        case XTC_KOP_EXP: return "exp";
+        case XTC_KOP_REDUCE_MAX: return "reduce_max";
+        case XTC_KOP_REDUCE_SUM: return "reduce_sum";
+        case XTC_KOP_SUB_ROW: return "sub_row";
+        case XTC_KOP_DIV_ROW: return "div_row";
         default:          return "matmul";
     }
 }
@@ -178,7 +186,7 @@ static bool ggml_xtc_kop_is_matmul(ggml_xtc_kop kop) {
 
 struct ggml_xtc_input_desc {
     const char * dtype;
-    int64_t      d0, d1;
+    int64_t      d0, d1; // d1 = 0: 1D tensor (d0)
     bool         transposed; // layout [1,0]
 };
 
@@ -207,11 +215,18 @@ static ggml_xtc_kernel_desc ggml_xtc_describe(const ggml_xtc_kernel_shape & s) {
             break;
         case XTC_KOP_RSQRT:
         case XTC_KOP_SILU:
+        case XTC_KOP_EXP:
+        case XTC_KOP_REDUCE_MAX:
+        case XTC_KOP_REDUCE_SUM:
             d.inputs = { { "float32", s.m, s.n, false } };
             break;
         case XTC_KOP_CAST_F16:
             d.inputs = { { "float32", s.m, s.n, false } };
             d.attr_dtype = "float16";
+            break;
+        case XTC_KOP_SUB_ROW:
+        case XTC_KOP_DIV_ROW:
+            d.inputs = { { "float32", s.m, s.n, false }, { "float32", s.m, 0, false } };
             break;
         case XTC_KOP_FMA:
             d.inputs = { { "float32", s.m, s.n, false }, { "float32", s.m, s.n, false }, { "float32", s.m, s.n, false } };
@@ -240,8 +255,9 @@ static std::string ggml_xtc_canonical_json(const ggml_xtc_kernel_shape & s) {
     for (int i = 0; i < n_in; i++) {
         const ggml_xtc_input_desc & in = d.inputs[i];
         char buf[256];
-        snprintf(buf, sizeof(buf), "%s{\"expr\":{\"type\":{\"dtype\":\"%s\",%s\"shape\":[%" PRId64 ",%" PRId64 "]}},\"uid\":\"%%%d\"}",
-                 i ? "," : "", in.dtype, in.transposed ? "\"layout\":[1,0]," : "", in.d0, in.d1, i);
+        const std::string dims = in.d1 > 0 ? std::to_string(in.d0) + "," + std::to_string(in.d1) : std::to_string(in.d0);
+        snprintf(buf, sizeof(buf), "%s{\"expr\":{\"type\":{\"dtype\":\"%s\",%s\"shape\":[%s]}},\"uid\":\"%%%d\"}",
+                 i ? "," : "", in.dtype, in.transposed ? "\"layout\":[1,0]," : "", dims.c_str(), i);
         json += buf;
     }
     json += "],\"nodes\":[{\"expr\":{\"args\":[";
@@ -270,8 +286,9 @@ static std::string ggml_xtc_graph_yaml(const ggml_xtc_kernel_shape & s) {
         const ggml_xtc_input_desc & in = d.inputs[i];
         const std::string uid = op + "_in" + std::to_string(i);
         char buf[256];
-        snprintf(buf, sizeof(buf), "- uid: %s\n  name: %c\n  expr:\n    type: {shape: [%" PRId64 ", %" PRId64 "], dtype: %s%s}\n",
-                 uid.c_str(), (char) ('A' + i), in.d0, in.d1, in.dtype, in.transposed ? ", layout: [1, 0]" : "");
+        const std::string dims = in.d1 > 0 ? std::to_string(in.d0) + ", " + std::to_string(in.d1) : std::to_string(in.d0);
+        snprintf(buf, sizeof(buf), "- uid: %s\n  name: %c\n  expr:\n    type: {shape: [%s], dtype: %s%s}\n",
+                 uid.c_str(), (char) ('A' + i), dims.c_str(), in.dtype, in.transposed ? ", layout: [1, 0]" : "");
         yaml += buf;
         args += (i ? ", " : "") + uid;
     }
@@ -285,9 +302,6 @@ static std::string ggml_xtc_graph_yaml(const ggml_xtc_kernel_shape & s) {
 //
 
 using ggml_xtc_kernel_fn = void (*)(void *, void *, void *);
-
-// KV cells per attention block (n_kv is a multiple of 256 in llama.cpp)
-static const int64_t GGML_XTC_FA_BLOCK = 256;
 
 enum class ggml_xtc_kernel_state { FOUND, MISSING, BROKEN };
 
@@ -511,12 +525,21 @@ static std::vector<ggml_xtc_kernel_shape> ggml_xtc_node_kernels(const struct ggm
             }
             break;
         case GGML_OP_FLASH_ATTN_EXT:
-            // Q.K^T and P.V on blocks of GGML_XTC_FA_BLOCK KV cells, the online softmax stays in C
-            if (ggml_xtc_lib_supports_op(op) && src1->ne[1] % GGML_XTC_FA_BLOCK == 0) {
+            // standard attention over the whole KV length N (see ggml_xtc_run_flash_attn_kernels)
+            if (ggml_xtc_lib_supports_op(op) && src1->ne[1] > 0) {
                 const int64_t M = (src0->ne[2] / src1->ne[2]) * src0->ne[1];
                 const int64_t D = src0->ne[0];
-                out.push_back({ XTC_KOP_MATMUL_F16_BT, M, GGML_XTC_FA_BLOCK, D });
-                out.push_back({ XTC_KOP_MATMUL_F16, M, D, GGML_XTC_FA_BLOCK });
+                const int64_t N = src1->ne[1];
+                out.push_back({ XTC_KOP_CAST_F16, M, D, 0 });
+                out.push_back({ XTC_KOP_MATMUL_F16_BT, M, N, D });
+                out.push_back({ XTC_KOP_FMA, M, N, 0 });
+                out.push_back({ XTC_KOP_REDUCE_MAX, M, N, 0 });
+                out.push_back({ XTC_KOP_SUB_ROW, M, N, 0 });
+                out.push_back({ XTC_KOP_EXP, M, N, 0 });
+                out.push_back({ XTC_KOP_REDUCE_SUM, M, N, 0 });
+                out.push_back({ XTC_KOP_DIV_ROW, M, N, 0 });
+                out.push_back({ XTC_KOP_CAST_F16, M, N, 0 });
+                out.push_back({ XTC_KOP_MATMUL_F16, M, D, N });
             }
             break;
         default:
@@ -991,9 +1014,9 @@ static void ggml_xtc_run_rope_kernels(const std::vector<ggml_xtc_kernel_fn> & fn
     }
 }
 
-// Per (sequence, KV head): the queries of the GQA group are the rows of one matmul. For each block of
-// GGML_XTC_FA_BLOCK cells: S = Q.K^T (kernel), online softmax in C, then acc += P.V (kernel).
-// Like the CPU backend, Q is rounded to F16, and here the weights P too.
+// Standard attention, per (sequence, KV head): the queries of the GQA group are the M rows of the kernels.
+//   q16 = F16(Q); S = q16.K^T; S = S * scale + mask; P = softmax_rows(S); out = F16(P).V
+// Like the CPU backend, Q and P are rounded to F16. The kernels are listed in ggml_xtc_node_kernels.
 static void ggml_xtc_run_flash_attn_kernels(const std::vector<ggml_xtc_kernel_fn> & fns, struct ggml_tensor * dst) {
     const struct ggml_tensor * q    = dst->src[0];
     const struct ggml_tensor * k    = dst->src[1];
@@ -1002,86 +1025,74 @@ static void ggml_xtc_run_flash_attn_kernels(const std::vector<ggml_xtc_kernel_fn
     float scale;
     memcpy(&scale, dst->op_params, sizeof(float));
 
-    const int64_t D      = q->ne[0];
-    const int64_t n_tok  = q->ne[1];
-    const int64_t n_kv   = k->ne[1];
-    const int64_t rk2    = q->ne[2] / k->ne[2];
-    const int64_t M      = rk2 * n_tok;
-    const int64_t BL     = GGML_XTC_FA_BLOCK;
+    const int64_t D     = q->ne[0];
+    const int64_t n_tok = q->ne[1];
+    const int64_t n_kv  = k->ne[1];
+    const int64_t rk2   = q->ne[2] / k->ne[2];
+    const int64_t M     = rk2 * n_tok;
 
-    std::vector<ggml_fp16_t> qh(M * D), kb(BL * D), vb(BL * D), P(M * BL);
-    std::vector<float>       S(M * BL), O(M * D), acc(M * D), m(M), l(M), sc(BL);
+    std::vector<float>       qf(M * D), S(M * n_kv), scale_v(M * n_kv, scale), mask_f(M * n_kv, 0.0f), tmp(M * n_kv);
+    std::vector<float>       row_max(M), row_sum(M), O(M * D);
+    std::vector<ggml_fp16_t> q16(M * D), p16(M * n_kv), k_g, v_g;
 
     for (int64_t s = 0; s < q->ne[3]; s++) {
         for (int64_t g = 0; g < k->ne[2]; g++) {
-            for (int64_t hh = 0; hh < rk2; hh++) {
-                for (int64_t t = 0; t < n_tok; t++) {
-                    const float * qp = (const float *) ((const char *) q->data + t * q->nb[1] + (g * rk2 + hh) * q->nb[2] + s * q->nb[3]);
-                    for (int64_t d = 0; d < D; d++) {
-                        qh[(hh * n_tok + t) * D + d] = ggml_fp32_to_fp16(qp[d]);
+            for (int64_t r = 0; r < M; r++) {
+                const int64_t h = g * rk2 + r / n_tok;
+                const int64_t t = r % n_tok;
+                memcpy(&qf[r * D], (const char *) q->data + t * q->nb[1] + h * q->nb[2] + s * q->nb[3], D * sizeof(float));
+                if (mask) {
+                    const ggml_fp16_t * mp = (const ggml_fp16_t *) ((const char *) mask->data + t * mask->nb[1] +
+                        (h % mask->ne[2]) * mask->nb[2] + (s % mask->ne[3]) * mask->nb[3]);
+                    for (int64_t j = 0; j < n_kv; j++) {
+                        mask_f[r * n_kv + j] = ggml_fp16_to_fp32(mp[j]);
                     }
                 }
             }
-            std::fill(acc.begin(), acc.end(), 0.0f);
-            std::fill(m.begin(), m.end(), -INFINITY);
-            std::fill(l.begin(), l.end(), 0.0f);
 
-            for (int64_t b0 = 0; b0 < n_kv; b0 += BL) {
-                for (int64_t j = 0; j < BL; j++) {
-                    memcpy(&kb[j * D], (const char *) k->data + (b0 + j) * k->nb[1] + g * k->nb[2] + s * k->nb[3], D * sizeof(ggml_fp16_t));
+            // K and V of this head, (n_kv, D) F16 rows: used in place when they are packed in the cache
+            const char * kp = (const char *) k->data + g * k->nb[2] + s * k->nb[3];
+            const char * vp = (const char *) v->data + g * v->nb[2] + s * v->nb[3];
+            if (k->nb[1] != D * sizeof(ggml_fp16_t)) {
+                k_g.resize(n_kv * D);
+                for (int64_t j = 0; j < n_kv; j++) {
+                    memcpy(&k_g[j * D], kp + j * k->nb[1], D * sizeof(ggml_fp16_t));
                 }
-                fns[0](qh.data(), kb.data(), S.data());
+                kp = (const char *) k_g.data();
+            }
+            if (v->nb[1] != D * sizeof(ggml_fp16_t)) {
+                v_g.resize(n_kv * D);
+                for (int64_t j = 0; j < n_kv; j++) {
+                    memcpy(&v_g[j * D], vp + j * v->nb[1], D * sizeof(ggml_fp16_t));
+                }
+                vp = (const char *) v_g.data();
+            }
 
-                bool any = false;
-                for (int64_t r = 0; r < M; r++) {
-                    const int64_t h = g * rk2 + r / n_tok;
-                    const int64_t t = r % n_tok;
-                    const ggml_fp16_t * mp = mask ? (const ggml_fp16_t *) ((const char *) mask->data + t * mask->nb[1] +
-                        (h % mask->ne[2]) * mask->nb[2] + (s % mask->ne[3]) * mask->nb[3]) + b0 : nullptr;
-
-                    float mb = -INFINITY;
-                    for (int64_t j = 0; j < BL; j++) {
-                        sc[j] = S[r * BL + j] * scale + (mp ? ggml_fp16_to_fp32(mp[j]) : 0.0f);
-                        mb    = std::max(mb, sc[j]);
-                    }
-                    ggml_fp16_t * Pr = &P[r * BL];
-                    if (mb == -INFINITY) {
-                        std::fill(Pr, Pr + BL, ggml_fp32_to_fp16(0.0f));
-                        continue;
-                    }
-                    any = true;
-                    const float m_new = std::max(m[r], mb);
-                    const float rs    = expf(m[r] - m_new); // 0 on the first block (m = -inf)
-                    for (int64_t d = 0; d < D; d++) {
-                        acc[r * D + d] *= rs;
-                    }
-                    l[r] *= rs;
-                    for (int64_t j = 0; j < BL; j++) {
-                        Pr[j] = ggml_fp32_to_fp16(expf(sc[j] - m_new));
-                        l[r] += ggml_fp16_to_fp32(Pr[j]);
-                    }
-                    m[r] = m_new;
-                }
-                if (!any) {
-                    continue;
-                }
-                for (int64_t j = 0; j < BL; j++) {
-                    memcpy(&vb[j * D], (const char *) v->data + (b0 + j) * v->nb[1] + g * v->nb[2] + s * v->nb[3], D * sizeof(ggml_fp16_t));
-                }
-                fns[1](P.data(), vb.data(), O.data());
-                for (int64_t i = 0; i < M * D; i++) {
-                    acc[i] += O[i];
+            ggml_xtc_call_unary(fns[0], qf.data(), q16.data());                           // q16 = F16(Q)
+            fns[1](q16.data(), (void *) kp, S.data());                                    // S = q16.K^T
+            ((ggml_xtc_kernel_fn4) fns[2])(S.data(), scale_v.data(), mask_f.data(), S.data()); // S = S * scale + mask
+            ggml_xtc_call_unary(fns[3], S.data(), row_max.data());                        // row max
+            for (int64_t r = 0; r < M; r++) {
+                if (row_max[r] == -INFINITY) { // fully masked row: exp(-inf) = 0 and a zero output
+                    row_max[r] = 0.0f;
                 }
             }
+            fns[4](S.data(), row_max.data(), tmp.data());                                 // S - max
+            ggml_xtc_call_unary(fns[5], tmp.data(), tmp.data());                          // exp
+            ggml_xtc_call_unary(fns[6], tmp.data(), row_sum.data());                      // row sum
+            for (int64_t r = 0; r < M; r++) {
+                if (row_sum[r] == 0.0f) {
+                    row_sum[r] = 1.0f;
+                }
+            }
+            fns[7](tmp.data(), row_sum.data(), tmp.data());                               // P
+            ggml_xtc_call_unary(fns[8], tmp.data(), p16.data());                          // F16(P)
+            fns[9](p16.data(), (void *) vp, O.data());                                    // out = P.V
 
             for (int64_t r = 0; r < M; r++) {
                 const int64_t h = g * rk2 + r / n_tok;
                 const int64_t t = r % n_tok;
-                float *       out = (float *) ((char *) dst->data + h * dst->nb[1] + t * dst->nb[2] + s * dst->nb[3]);
-                const float   inv = l[r] > 0.0f ? 1.0f / l[r] : 0.0f;
-                for (int64_t d = 0; d < D; d++) {
-                    out[d] = acc[r * D + d] * inv;
-                }
+                memcpy((char *) dst->data + h * dst->nb[1] + t * dst->nb[2] + s * dst->nb[3], &O[r * D], D * sizeof(float));
             }
         }
     }
