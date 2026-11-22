@@ -86,6 +86,18 @@ bool ggml_xtc_is_supported_matmul(const struct ggml_tensor * op, ggml_xtc_kernel
 // F32 ADD / MUL whose inputs and output are contiguous and of the same shape: one kernel call on (M, N)
 bool ggml_xtc_is_flat_eltwise(const struct ggml_tensor * op);
 
+// all the rows of the node and of its sources are packed, so one kernel call can take them all
+bool ggml_xtc_flat_rows(const struct ggml_tensor * op);
+
+// Kernels needed by a node, in call order. Empty when xtc_support_lib runs the node.
+std::vector<ggml_xtc_kernel_shape> ggml_xtc_node_kernels(const struct ggml_tensor * op);
+
+// F32 tensor with packed rows (nb[0] == sizeof(float)), false for null
+bool ggml_xtc_f32_rows(const struct ggml_tensor * t);
+
+// xtc_support_lib can run the node on the host: op params and shapes are valid for its reference kernels
+bool ggml_xtc_lib_supports_op(const struct ggml_tensor * op);
+
 // value of "key: value" in a meta.yaml file, empty when absent
 std::string ggml_xtc_meta_value(const std::filesystem::path & meta, const std::string & key);
 
