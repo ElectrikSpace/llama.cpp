@@ -278,6 +278,7 @@ set   (GGML_VULKAN_SHADERS_GEN_TOOLCHAIN "" CACHE FILEPATH "ggml: toolchain file
 
 option(GGML_ZENDNN                          "ggml: use ZenDNN"                                OFF)
 option(GGML_XTC                             "ggml: use xtc Transform Compiler"                OFF)
+option(GGML_XTC_MPPA                        "ggml: use xtc MPPA device (ggml-xtc-mppa)"       OFF)
 option(ZENDNN_ROOT                          "ggml: path to ZenDNN installation"               "")
 
 # extra artifacts
@@ -344,6 +345,7 @@ set(GGML_PUBLIC_HEADERS
     include/ggml-webgpu.h
     include/ggml-zendnn.h
     include/ggml-xtc.h
+    include/ggml-xtc-mppa.h
     include/ggml-openvino.h
     include/gguf.h)
 

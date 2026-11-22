@@ -251,7 +251,7 @@ static std::string ggml_xtc_trim(std::string s) {
 }
 
 // minimal "top-level scalar key" reader for meta.yaml
-static std::string ggml_xtc_meta_value(const fs::path & meta, const std::string & key) {
+std::string ggml_xtc_meta_value(const fs::path & meta, const std::string & key) {
     std::ifstream in(meta);
     std::string line;
     const std::string prefix = key + ":";
@@ -403,6 +403,14 @@ bool ggml_xtc_is_supported_matmul(const struct ggml_tensor * op, ggml_xtc_kernel
         shape->k = src0->ne[0];
     }
     return true;
+}
+
+bool ggml_xtc_is_flat_eltwise(const struct ggml_tensor * op) {
+    const struct ggml_tensor * src0 = op->src[0];
+    const struct ggml_tensor * src1 = op->src[1];
+    return src0 != nullptr && src1 != nullptr && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+           op->type == GGML_TYPE_F32 && ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(op) &&
+           ggml_are_same_shape(src0, src1) && ggml_are_same_shape(src0, op);
 }
 
 //

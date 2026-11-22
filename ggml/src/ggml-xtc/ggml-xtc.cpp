@@ -78,14 +78,6 @@ static bool ggml_xtc_missing_falls_back_to_cpu() {
 
 static bool ggml_xtc_lib_supports_op(const struct ggml_tensor * op);
 
-static bool ggml_xtc_is_flat_eltwise(const struct ggml_tensor * op) {
-    const struct ggml_tensor * src0 = op->src[0];
-    const struct ggml_tensor * src1 = op->src[1];
-    return src0 != nullptr && src1 != nullptr && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
-           op->type == GGML_TYPE_F32 && ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(op) &&
-           ggml_are_same_shape(src0, src1) && ggml_are_same_shape(src0, op);
-}
-
 // all the rows of the node and of its sources are packed, so one kernel call can take them all
 static bool ggml_xtc_flat_rows(const struct ggml_tensor * op) {
     for (int i = 0; i < GGML_MAX_SRC; i++) {

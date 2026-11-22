@@ -83,6 +83,12 @@ bool                  ggml_xtc_bundle_only();
 // the kernel; M (= number of tokens in the batch) is a static shape of the kernel.
 bool ggml_xtc_is_supported_matmul(const struct ggml_tensor * op, ggml_xtc_kernel_shape * shape);
 
+// F32 ADD / MUL whose inputs and output are contiguous and of the same shape: one kernel call on (M, N)
+bool ggml_xtc_is_flat_eltwise(const struct ggml_tensor * op);
+
+// value of "key: value" in a meta.yaml file, empty when absent
+std::string ggml_xtc_meta_value(const std::filesystem::path & meta, const std::string & key);
+
 struct ggml_xtc_missing_entry {
     std::string           key;
     ggml_xtc_kernel_shape shape;
