@@ -457,6 +457,11 @@ static bool ggml_xtc_mppa_is_f16(const struct ggml_tensor * op) {
 
 // A node is claimed when it is a view or a leaf, or when it runs as kernels with a runner
 static bool ggml_xtc_mppa_supports(const struct ggml_tensor * op) {
+    // same switch as the XTC CPU device: lets a run use the standard backends only (reference runs)
+    const char * disable = getenv("GGML_XTC_DISABLE");
+    if (disable != nullptr && disable[0] != '\0' && strcmp(disable, "0") != 0) {
+        return false;
+    }
     if (ggml_op_is_empty(op->op)) {
         return true;
     }

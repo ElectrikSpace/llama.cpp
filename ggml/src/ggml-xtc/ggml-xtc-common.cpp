@@ -384,7 +384,13 @@ bool ggml_xtc_is_supported_matmul(const struct ggml_tensor * op, ggml_xtc_kernel
     }
     // only matmuls with a model weight: attention matmuls over the KV cache have a shape
     // that depends on the context length, which static-shape kernels can not follow
-    if (src0->buffer == nullptr || ggml_backend_buffer_get_usage(src0->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+    // (llama.cpp probes a weight buffer type with a 0-byte dummy buffer of usage ANY, before the weights are loaded)
+    if (src0->buffer == nullptr) {
+        return false;
+    }
+    const bool is_probe = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_ANY &&
+                          ggml_backend_buffer_get_size(src0->buffer) == 0;
+    if (ggml_backend_buffer_get_usage(src0->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS && !is_probe) {
         return false;
     }
     if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
