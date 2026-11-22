@@ -3,6 +3,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
+#include "xtc_kernel_abi.h"
 #include "xtc_support_lib.h"
 
 #include <cinttypes>
@@ -12,6 +13,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <map>
 #include <mutex>
 #include <string>
@@ -47,8 +49,13 @@ namespace fs = std::filesystem;
 // (graph.yaml + a build_kernel.py where only the schedule is missing) is written to <kernelbase>/_pending/<key>/.
 // The user fills the schedule in build_kernel.py, runs it, then reruns llama.cpp.
 //
+// Kernels come from the bundle libxtc_kernels.so (XTC_KERNEL_LIB, default <kernelbase>/libxtc_kernels.so),
+// whose wrappers check the tensors. Without a bundle entry, <kernelbase>/<key>/kernel.so is used (unchecked).
+//
 // Environment:
 //   XTC_KERNELBASE           kernel base root (default: ./xtc_kernelbase)
+//   XTC_KERNEL_LIB           kernel bundle (default: <kernelbase>/libxtc_kernels.so)
+//   GGML_XTC_BUNDLE_ONLY     1 -> only the bundle is used, no per-entry kernel.so
 //   GGML_XTC_MISSING_KERNEL  fail (default) | cpu   (cpu: the device does not claim matmuls without kernel, so
 //                            the scheduler runs them on another backend, normally the CPU one)
 //   GGML_XTC_DISABLE         1 -> the XTC device claims no op at all
@@ -301,19 +308,23 @@ static std::string ggml_xtc_graph_yaml(const ggml_xtc_kernel_shape & s) {
 // kernel base access
 //
 
-using ggml_xtc_kernel_fn = void (*)(void *, void *, void *);
+using ggml_xtc_kernel_fn = void (*)(void *, void *, void *); // raw kernel.so symbol: cast by the number of inputs
 
 enum class ggml_xtc_kernel_state { FOUND, MISSING, BROKEN };
 
 struct ggml_xtc_kernel {
     ggml_xtc_kernel_state state = ggml_xtc_kernel_state::MISSING;
-    ggml_xtc_kernel_fn    fn    = nullptr;
+    xtc_kernel_call_fn    call  = nullptr; // bundle wrapper (checked)
+    ggml_xtc_kernel_fn    fn    = nullptr; // kernel.so symbol (unchecked)
+    int                   n_inputs = 0;
     std::string           key;
     std::string           error;   // when BROKEN
 };
 
 static std::mutex                                     g_xtc_mutex;
 static std::map<ggml_xtc_kernel_shape, ggml_xtc_kernel> g_xtc_kernels;
+static std::map<std::string, const xtc_kernel_entry *> g_xtc_bundle;
+static bool                                           g_xtc_bundle_checked = false;
 
 static fs::path ggml_xtc_kernelbase_root() {
     const char * env = getenv("XTC_KERNELBASE");
@@ -321,6 +332,11 @@ static fs::path ggml_xtc_kernelbase_root() {
     std::error_code ec;
     fs::path abs = fs::absolute(root, ec);
     return ec ? root : abs;
+}
+
+static bool ggml_xtc_bundle_only() {
+    const char * env = getenv("GGML_XTC_BUNDLE_ONLY");
+    return env != nullptr && env[0] != '\0' && strcmp(env, "0") != 0;
 }
 
 static std::string ggml_xtc_trim(std::string s) {
@@ -372,6 +388,38 @@ static std::string ggml_xtc_dlerror() {
 }
 
 // g_xtc_mutex must be held
+static void ggml_xtc_load_bundle() {
+    if (g_xtc_bundle_checked) {
+        return;
+    }
+    g_xtc_bundle_checked = true;
+
+    const char * env = getenv("XTC_KERNEL_LIB");
+    const fs::path path = (env != nullptr && env[0] != '\0') ? fs::path(env) : ggml_xtc_kernelbase_root() / "libxtc_kernels.so";
+    std::error_code ec;
+    if (!fs::exists(path, ec)) {
+        return;
+    }
+    void * handle = ggml_xtc_dlopen(path.string().c_str());
+    if (handle == nullptr) {
+        GGML_LOG_WARN("%s: cannot load %s: %s\n", __func__, path.string().c_str(), ggml_xtc_dlerror().c_str());
+        return;
+    }
+    const uint32_t *         version = (const uint32_t *) ggml_xtc_dlsym(handle, "xtc_kernel_abi_version");
+    const size_t *           n       = (const size_t *) ggml_xtc_dlsym(handle, "xtc_kernel_registry_size");
+    const xtc_kernel_entry * reg     = (const xtc_kernel_entry *) ggml_xtc_dlsym(handle, "xtc_kernel_registry");
+    if (version == nullptr || n == nullptr || reg == nullptr || *version != XTC_KERNEL_ABI_VERSION) {
+        GGML_LOG_WARN("%s: %s is not a kernel bundle of ABI version %d\n", __func__, path.string().c_str(),
+                      XTC_KERNEL_ABI_VERSION);
+        return;
+    }
+    for (size_t i = 0; i < *n; i++) {
+        g_xtc_bundle[reg[i].key] = &reg[i];
+    }
+    GGML_LOG_INFO("%s: %zu kernel(s) from %s\n", __func__, *n, path.string().c_str());
+}
+
+// g_xtc_mutex must be held
 static ggml_xtc_kernel & ggml_xtc_get_kernel(const ggml_xtc_kernel_shape & shape) {
     auto it = g_xtc_kernels.find(shape);
     if (it != g_xtc_kernels.end()) {
@@ -379,13 +427,28 @@ static ggml_xtc_kernel & ggml_xtc_get_kernel(const ggml_xtc_kernel_shape & shape
     }
 
     ggml_xtc_kernel k;
-    k.key = ggml_xtc_kernel_key(shape);
+    k.key      = ggml_xtc_kernel_key(shape);
+    k.n_inputs = (int) ggml_xtc_describe(shape).inputs.size();
+
+    ggml_xtc_load_bundle();
+    const auto entry = g_xtc_bundle.find(k.key);
+    if (entry != g_xtc_bundle.end()) {
+        if (entry->second->n_inputs != k.n_inputs) {
+            k.state = ggml_xtc_kernel_state::BROKEN;
+            k.error = "bundle entry has " + std::to_string(entry->second->n_inputs) + " inputs, expected " +
+                      std::to_string(k.n_inputs);
+        } else {
+            k.state = ggml_xtc_kernel_state::FOUND;
+            k.call  = entry->second->call;
+        }
+        return g_xtc_kernels.emplace(shape, std::move(k)).first->second;
+    }
 
     const fs::path dir  = ggml_xtc_kernelbase_root() / k.key;
     const fs::path meta = dir / "meta.yaml";
     const fs::path so   = dir / "kernel.so";
 
-    if (fs::exists(meta) && fs::exists(so)) {
+    if (!ggml_xtc_bundle_only() && fs::exists(meta) && fs::exists(so)) {
         std::string sym = ggml_xtc_meta_value(meta, "payload_name");
         if (sym.empty()) {
             sym = ggml_xtc_op_name(shape.kop);
@@ -671,11 +734,12 @@ static std::string ggml_xtc_failure_message(const fs::path & root,
             "  1. in each <stub>/build_kernel.py, fill SPEC (the XTC schedule) and set TODO = False\n"
             "  2. python <stub>/build_kernel.py     (or all at once: xtc-kernelbase build --root '%s')\n"
             "     -> compiles, validates and inserts the kernel in the kernel base\n"
-            "  3. rerun llama.cpp with the same model and arguments\n"
+            "  3. xtc-kernelbase bundle --root '%s'  (or keep the per-entry kernel.so: found without it)\n"
+            "  4. rerun llama.cpp with the same model and arguments\n"
             "Tips: kernels have a static shape and M is the number of tokens in the micro-batch, so each\n"
             "      micro-batch size needs its own kernels. Run with `-ub 1` to only need the M=1 kernels.\n"
             "      GGML_XTC_MISSING_KERNEL=cpu leaves those matmuls to the CPU backend instead of failing.\n",
-            root.string().c_str());
+            root.string().c_str(), root.string().c_str());
         msg += line;
     }
     for (const auto & b : broken) {
@@ -701,7 +765,47 @@ static bool ggml_xtc_node_is_noop(const struct ggml_tensor * node) {
     }
 }
 
-static void ggml_xtc_run_mul_mat_kernel(ggml_xtc_kernel_fn fn, struct ggml_tensor * dst) {
+// packed 2D view (ne0 contiguous, ne1 rows) of data, as the kernel wrappers expect
+static ggml_tensor ggml_xtc_view2d(enum ggml_type type, int64_t ne0, int64_t ne1, const void * data) {
+    ggml_tensor t = {};
+    t.type  = type;
+    t.data  = const_cast<void *>(data);
+    t.ne[0] = ne0;
+    t.ne[1] = ne1;
+    t.ne[2] = 1;
+    t.ne[3] = 1;
+    t.nb[0] = ggml_type_size(type);
+    t.nb[1] = t.nb[0] * ne0;
+    t.nb[2] = t.nb[1] * ne1;
+    t.nb[3] = t.nb[2];
+    return t;
+}
+
+// srcs in kernel input order, dst the output. A mismatch between the tensors and the kernel is a backend bug.
+static void ggml_xtc_invoke(const ggml_xtc_kernel & k, std::initializer_list<const ggml_tensor *> srcs,
+                            ggml_tensor * dst) {
+    GGML_ASSERT((int) srcs.size() == k.n_inputs);
+    if (k.call != nullptr) {
+        if (k.call(srcs.begin(), dst) != 0) {
+            GGML_ABORT("%s: tensors do not match XTC kernel %s", __func__, k.key.c_str());
+        }
+        return;
+    }
+    void * p[4];
+    int n = 0;
+    for (const ggml_tensor * s : srcs) {
+        p[n++] = s->data;
+    }
+    p[n] = dst->data;
+    switch (n) {
+        case 1: ((void (*)(void *, void *)) k.fn)(p[0], p[1]); break;
+        case 2: k.fn(p[0], p[1], p[2]); break;
+        case 3: ((void (*)(void *, void *, void *, void *)) k.fn)(p[0], p[1], p[2], p[3]); break;
+        default: GGML_ABORT("%s: unexpected arity %d", __func__, n);
+    }
+}
+
+static void ggml_xtc_run_mul_mat_kernel(const ggml_xtc_kernel & k, struct ggml_tensor * dst) {
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
 
@@ -722,12 +826,15 @@ static void ggml_xtc_run_mul_mat_kernel(ggml_xtc_kernel_fn fn, struct ggml_tenso
             const int64_t i03 = i13 / r3;
             const int64_t i02 = i12 / r2;
 
-            // base addresses of the three 2D operands (byte strides, as in ggml)
-            void * a = (void *) ((char *) src1->data + i12 * nb12 + i13 * nb13);
-            void * b = (void *) ((char *) src0->data + i02 * nb02 + i03 * nb03);
-            void * c = (void *) ((char *) dst->data  + i12 * nb2  + i13 * nb3);
+            const void * a = (const char *) src1->data + i12 * nb12 + i13 * nb13;
+            const void * b = (const char *) src0->data + i02 * nb02 + i03 * nb03;
+            void *       c = (char *) dst->data + i12 * nb2 + i13 * nb3;
 
-            fn(a, b, c);
+            // B is stored transposed: (K, N) with ne0 = K
+            ggml_tensor va = ggml_xtc_view2d(GGML_TYPE_F32, ne10, ne11, a);
+            ggml_tensor vb = ggml_xtc_view2d(GGML_TYPE_F32, ne00, ne01, b);
+            ggml_tensor vc = ggml_xtc_view2d(GGML_TYPE_F32, ne0, ne1, c);
+            ggml_xtc_invoke(k, { &va, &vb }, &vc);
         }
     }
 }
@@ -880,13 +987,6 @@ static void ggml_xtc_run_lib_op(struct ggml_tensor * dst) {
     }
 }
 
-using ggml_xtc_kernel_fn4 = void (*)(void *, void *, void *, void *);
-
-// one input, one output
-static void ggml_xtc_call_unary(ggml_xtc_kernel_fn fn, void * in, void * out) {
-    ((void (*)(void *, void *)) fn)(in, out);
-}
-
 // when the node is not flat, kernels are called once per row (M = 1)
 template <typename F>
 static void ggml_xtc_for_each_chunk(const struct ggml_tensor * dst, F && f) {
@@ -908,7 +1008,7 @@ static void * ggml_xtc_row_ptr(const struct ggml_tensor * t, int64_t i1, int64_t
 }
 
 // kernels: x*x, row sums (matmul by 1/N), + eps, rsqrt, broadcast (matmul by ones), x * scale
-static void ggml_xtc_run_rms_norm_kernels(const std::vector<ggml_xtc_kernel_fn> & fns, struct ggml_tensor * dst) {
+static void ggml_xtc_run_rms_norm_kernels(const std::vector<const ggml_xtc_kernel *> & fns, struct ggml_tensor * dst) {
     const struct ggml_tensor * src0 = dst->src[0];
     float eps;
     memcpy(&eps, dst->op_params, sizeof(float));
@@ -919,68 +1019,94 @@ static void ggml_xtc_run_rms_norm_kernels(const std::vector<ggml_xtc_kernel_fn> 
     std::vector<float> sq(M * N), bc(M * N), mean(M), mean_eps(M), rs(M);
 
     ggml_xtc_for_each_chunk(dst, [&](int64_t i1, int64_t i2, int64_t i3) {
-        void * x = ggml_xtc_row_ptr(src0, i1, i2, i3);
-        fns[0](x, x, sq.data());
-        fns[1](sq.data(), inv_n.data(), mean.data());
-        fns[2](mean.data(), eps_v.data(), mean_eps.data());
-        ggml_xtc_call_unary(fns[3], mean_eps.data(), rs.data());
-        fns[4](rs.data(), ones.data(), bc.data());
-        fns[5](x, bc.data(), ggml_xtc_row_ptr(dst, i1, i2, i3));
+        const void * x  = ggml_xtc_row_ptr(src0, i1, i2, i3);
+        void *       out = ggml_xtc_row_ptr(dst, i1, i2, i3);
+        ggml_tensor vx  = ggml_xtc_view2d(GGML_TYPE_F32, N, M, x);
+        ggml_tensor vsq = ggml_xtc_view2d(GGML_TYPE_F32, N, M, sq.data());
+        ggml_tensor vinv = ggml_xtc_view2d(GGML_TYPE_F32, N, 1, inv_n.data());
+        ggml_tensor vmean = ggml_xtc_view2d(GGML_TYPE_F32, 1, M, mean.data());
+        ggml_tensor veps = ggml_xtc_view2d(GGML_TYPE_F32, 1, M, eps_v.data());
+        ggml_tensor vmean_eps = ggml_xtc_view2d(GGML_TYPE_F32, 1, M, mean_eps.data());
+        ggml_tensor vrs = ggml_xtc_view2d(GGML_TYPE_F32, 1, M, rs.data());
+        ggml_tensor vones = ggml_xtc_view2d(GGML_TYPE_F32, 1, N, ones.data());
+        ggml_tensor vbc = ggml_xtc_view2d(GGML_TYPE_F32, N, M, bc.data());
+        ggml_tensor vout = ggml_xtc_view2d(GGML_TYPE_F32, N, M, out);
+
+        ggml_xtc_invoke(*fns[0], { &vx, &vx }, &vsq);
+        ggml_xtc_invoke(*fns[1], { &vsq, &vinv }, &vmean);
+        ggml_xtc_invoke(*fns[2], { &vmean, &veps }, &vmean_eps);
+        ggml_xtc_invoke(*fns[3], { &vmean_eps }, &vrs);
+        ggml_xtc_invoke(*fns[4], { &vrs, &vones }, &vbc);
+        ggml_xtc_invoke(*fns[5], { &vx, &vbc }, &vout);
     });
 }
 
 // kernels: silu(gate), then * up
-static void ggml_xtc_run_swiglu_kernels(const std::vector<ggml_xtc_kernel_fn> & fns, struct ggml_tensor * dst) {
+static void ggml_xtc_run_swiglu_kernels(const std::vector<const ggml_xtc_kernel *> & fns, struct ggml_tensor * dst) {
     const struct ggml_tensor * gate = dst->src[0];
     const struct ggml_tensor * up   = dst->src[1];
+    const int64_t N = dst->ne[0];
     const int64_t M = ggml_xtc_flat_rows(dst) ? ggml_nrows(dst) : 1;
-    std::vector<float> tmp(M * dst->ne[0]);
+    std::vector<float> tmp(M * N);
 
     ggml_xtc_for_each_chunk(dst, [&](int64_t i1, int64_t i2, int64_t i3) {
-        ggml_xtc_call_unary(fns[0], ggml_xtc_row_ptr(gate, i1, i2, i3), tmp.data());
-        fns[1](tmp.data(), ggml_xtc_row_ptr(up, i1, i2, i3), ggml_xtc_row_ptr(dst, i1, i2, i3));
+        ggml_tensor vgate = ggml_xtc_view2d(GGML_TYPE_F32, N, M, ggml_xtc_row_ptr(gate, i1, i2, i3));
+        ggml_tensor vtmp  = ggml_xtc_view2d(GGML_TYPE_F32, N, M, tmp.data());
+        ggml_tensor vup   = ggml_xtc_view2d(GGML_TYPE_F32, N, M, ggml_xtc_row_ptr(up, i1, i2, i3));
+        ggml_tensor vout  = ggml_xtc_view2d(GGML_TYPE_F32, N, M, ggml_xtc_row_ptr(dst, i1, i2, i3));
+        ggml_xtc_invoke(*fns[0], { &vgate }, &vtmp);
+        ggml_xtc_invoke(*fns[1], { &vtmp, &vup }, &vout);
     });
 }
 
 // kernel: F32 -> F16 cast of one row into the destination row
-static void ggml_xtc_run_set_rows_kernels(const std::vector<ggml_xtc_kernel_fn> & fns, struct ggml_tensor * dst) {
+static void ggml_xtc_run_set_rows_kernels(const std::vector<const ggml_xtc_kernel *> & fns, struct ggml_tensor * dst) {
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * idx  = dst->src[1];
+    const int64_t N = src0->ne[0];
     for (int64_t i3 = 0; i3 < src0->ne[3]; i3++) {
         for (int64_t i2 = 0; i2 < src0->ne[2]; i2++) {
             for (int64_t i = 0; i < src0->ne[1]; i++) {
                 const int64_t row = *(const int64_t *) ((const char *) idx->data + i * idx->nb[0] +
                                                         (i2 % idx->ne[1]) * idx->nb[1] + (i3 % idx->ne[2]) * idx->nb[2]);
-                ggml_xtc_call_unary(fns[0], ggml_xtc_row_ptr(src0, i, i2, i3), ggml_xtc_row_ptr(dst, row, i2, i3));
+                ggml_tensor vsrc = ggml_xtc_view2d(GGML_TYPE_F32, N, 1, ggml_xtc_row_ptr(src0, i, i2, i3));
+                ggml_tensor vdst = ggml_xtc_view2d(GGML_TYPE_F16, N, 1, ggml_xtc_row_ptr(dst, row, i2, i3));
+                ggml_xtc_invoke(*fns[0], { &vsrc }, &vdst);
             }
         }
     }
 }
 
 // one call of the (1, N) or (M, N) kernel on the whole tensor when it is flat, else one call per row of dst
-static void ggml_xtc_run_eltwise_kernel(ggml_xtc_kernel_fn fn, struct ggml_tensor * dst) {
+static void ggml_xtc_run_eltwise_kernel(const ggml_xtc_kernel & k, struct ggml_tensor * dst) {
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
+    const int64_t N = dst->ne[0];
 
     if (ggml_xtc_is_flat_eltwise(dst)) {
-        fn(src0->data, src1->data, dst->data);
+        ggml_tensor va = ggml_xtc_view2d(GGML_TYPE_F32, N, ggml_nrows(dst), src0->data);
+        ggml_tensor vb = ggml_xtc_view2d(GGML_TYPE_F32, N, ggml_nrows(dst), src1->data);
+        ggml_tensor vd = ggml_xtc_view2d(GGML_TYPE_F32, N, ggml_nrows(dst), dst->data);
+        ggml_xtc_invoke(k, { &va, &vb }, &vd);
         return;
     }
     for (int64_t i3 = 0; i3 < dst->ne[3]; i3++) {
         for (int64_t i2 = 0; i2 < dst->ne[2]; i2++) {
             for (int64_t i1 = 0; i1 < dst->ne[1]; i1++) {
-                void * a = (char *) src0->data + i1 * src0->nb[1] + i2 * src0->nb[2] + i3 * src0->nb[3];
-                void * b = (char *) src1->data + (i1 % src1->ne[1]) * src1->nb[1] + (i2 % src1->ne[2]) * src1->nb[2] +
-                           (i3 % src1->ne[3]) * src1->nb[3];
-                void * d = (char *) dst->data + i1 * dst->nb[1] + i2 * dst->nb[2] + i3 * dst->nb[3];
-                fn(a, b, d);
+                const void * a = ggml_xtc_row_ptr(src0, i1, i2, i3);
+                const void * b = (char *) src1->data + (i1 % src1->ne[1]) * src1->nb[1] + (i2 % src1->ne[2]) * src1->nb[2] +
+                                 (i3 % src1->ne[3]) * src1->nb[3];
+                ggml_tensor va = ggml_xtc_view2d(GGML_TYPE_F32, N, 1, a);
+                ggml_tensor vb = ggml_xtc_view2d(GGML_TYPE_F32, N, 1, b);
+                ggml_tensor vd = ggml_xtc_view2d(GGML_TYPE_F32, N, 1, ggml_xtc_row_ptr(dst, i1, i2, i3));
+                ggml_xtc_invoke(k, { &va, &vb }, &vd);
             }
         }
     }
 }
 
 // kernels: matmul by the swap matrix, mul by sin, fma with cos (see ggml_xtc_node_kernels)
-static void ggml_xtc_run_rope_kernels(const std::vector<ggml_xtc_kernel_fn> & fns, struct ggml_tensor * dst) {
+static void ggml_xtc_run_rope_kernels(const std::vector<const ggml_xtc_kernel *> & fns, struct ggml_tensor * dst) {
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src2 = dst->src[2];
     const int32_t * pos = (const int32_t *) dst->src[1]->data;
@@ -998,6 +1124,7 @@ static void ggml_xtc_run_rope_kernels(const std::vector<ggml_xtc_kernel_fn> & fn
     std::vector<float> swap(D * D), c(D), s(D), C(H * D), S(H * D), t1(H * D), t2(H * D);
     xtc_rope_swap_matrix(&p, D, swap.data());
 
+    ggml_tensor vswap = ggml_xtc_view2d(GGML_TYPE_F32, D, D, swap.data());
     for (int64_t i3 = 0; i3 < dst->ne[3]; i3++) {
         for (int64_t i2 = 0; i2 < dst->ne[2]; i2++) {
             xtc_rope_factors(&p, D, pos[i2], ff, c.data(), s.data());
@@ -1005,11 +1132,17 @@ static void ggml_xtc_run_rope_kernels(const std::vector<ggml_xtc_kernel_fn> & fn
                 memcpy(&C[h * D], c.data(), D * sizeof(float));
                 memcpy(&S[h * D], s.data(), D * sizeof(float));
             }
-            void * x   = (char *) src0->data + i2 * src0->nb[2] + i3 * src0->nb[3];
-            void * out = (char *) dst->data + i2 * dst->nb[2] + i3 * dst->nb[3];
-            fns[0](x, swap.data(), t1.data());
-            fns[1](t1.data(), S.data(), t2.data());
-            ((ggml_xtc_kernel_fn4) fns[2])(x, C.data(), t2.data(), out);
+            const void * x   = (const char *) src0->data + i2 * src0->nb[2] + i3 * src0->nb[3];
+            void *       out = (char *) dst->data + i2 * dst->nb[2] + i3 * dst->nb[3];
+            ggml_tensor vx   = ggml_xtc_view2d(GGML_TYPE_F32, D, H, x);
+            ggml_tensor vt1  = ggml_xtc_view2d(GGML_TYPE_F32, D, H, t1.data());
+            ggml_tensor vS   = ggml_xtc_view2d(GGML_TYPE_F32, D, H, S.data());
+            ggml_tensor vt2  = ggml_xtc_view2d(GGML_TYPE_F32, D, H, t2.data());
+            ggml_tensor vC   = ggml_xtc_view2d(GGML_TYPE_F32, D, H, C.data());
+            ggml_tensor vout = ggml_xtc_view2d(GGML_TYPE_F32, D, H, out);
+            ggml_xtc_invoke(*fns[0], { &vx, &vswap }, &vt1);
+            ggml_xtc_invoke(*fns[1], { &vt1, &vS }, &vt2);
+            ggml_xtc_invoke(*fns[2], { &vx, &vC, &vt2 }, &vout);
         }
     }
 }
@@ -1017,7 +1150,7 @@ static void ggml_xtc_run_rope_kernels(const std::vector<ggml_xtc_kernel_fn> & fn
 // Standard attention, per (sequence, KV head): the queries of the GQA group are the M rows of the kernels.
 //   q16 = F16(Q); S = q16.K^T; S = S * scale + mask; P = softmax_rows(S); out = F16(P).V
 // Like the CPU backend, Q and P are rounded to F16. The kernels are listed in ggml_xtc_node_kernels.
-static void ggml_xtc_run_flash_attn_kernels(const std::vector<ggml_xtc_kernel_fn> & fns, struct ggml_tensor * dst) {
+static void ggml_xtc_run_flash_attn_kernels(const std::vector<const ggml_xtc_kernel *> & fns, struct ggml_tensor * dst) {
     const struct ggml_tensor * q    = dst->src[0];
     const struct ggml_tensor * k    = dst->src[1];
     const struct ggml_tensor * v    = dst->src[2];
@@ -1068,26 +1201,39 @@ static void ggml_xtc_run_flash_attn_kernels(const std::vector<ggml_xtc_kernel_fn
                 vp = (const char *) v_g.data();
             }
 
-            ggml_xtc_call_unary(fns[0], qf.data(), q16.data());                           // q16 = F16(Q)
-            fns[1](q16.data(), (void *) kp, S.data());                                    // S = q16.K^T
-            ((ggml_xtc_kernel_fn4) fns[2])(S.data(), scale_v.data(), mask_f.data(), S.data()); // S = S * scale + mask
-            ggml_xtc_call_unary(fns[3], S.data(), row_max.data());                        // row max
+            ggml_tensor vqf   = ggml_xtc_view2d(GGML_TYPE_F32, D, M, qf.data());
+            ggml_tensor vq16  = ggml_xtc_view2d(GGML_TYPE_F16, D, M, q16.data());
+            ggml_tensor vk    = ggml_xtc_view2d(GGML_TYPE_F16, D, n_kv, kp);
+            ggml_tensor vv    = ggml_xtc_view2d(GGML_TYPE_F16, D, n_kv, vp);
+            ggml_tensor vS    = ggml_xtc_view2d(GGML_TYPE_F32, n_kv, M, S.data());
+            ggml_tensor vscale = ggml_xtc_view2d(GGML_TYPE_F32, n_kv, M, scale_v.data());
+            ggml_tensor vmask = ggml_xtc_view2d(GGML_TYPE_F32, n_kv, M, mask_f.data());
+            ggml_tensor vmax  = ggml_xtc_view2d(GGML_TYPE_F32, M, 1, row_max.data());
+            ggml_tensor vtmp  = ggml_xtc_view2d(GGML_TYPE_F32, n_kv, M, tmp.data());
+            ggml_tensor vsum  = ggml_xtc_view2d(GGML_TYPE_F32, M, 1, row_sum.data());
+            ggml_tensor vp16  = ggml_xtc_view2d(GGML_TYPE_F16, n_kv, M, p16.data());
+            ggml_tensor vO    = ggml_xtc_view2d(GGML_TYPE_F32, D, M, O.data());
+
+            ggml_xtc_invoke(*fns[0], { &vqf }, &vq16);                                // q16 = F16(Q)
+            ggml_xtc_invoke(*fns[1], { &vq16, &vk }, &vS);                            // S = q16.K^T
+            ggml_xtc_invoke(*fns[2], { &vS, &vscale, &vmask }, &vS);                  // S = S * scale + mask
+            ggml_xtc_invoke(*fns[3], { &vS }, &vmax);                                 // row max
             for (int64_t r = 0; r < M; r++) {
                 if (row_max[r] == -INFINITY) { // fully masked row: exp(-inf) = 0 and a zero output
                     row_max[r] = 0.0f;
                 }
             }
-            fns[4](S.data(), row_max.data(), tmp.data());                                 // S - max
-            ggml_xtc_call_unary(fns[5], tmp.data(), tmp.data());                          // exp
-            ggml_xtc_call_unary(fns[6], tmp.data(), row_sum.data());                      // row sum
+            ggml_xtc_invoke(*fns[4], { &vS, &vmax }, &vtmp);                          // S - max
+            ggml_xtc_invoke(*fns[5], { &vtmp }, &vtmp);                               // exp
+            ggml_xtc_invoke(*fns[6], { &vtmp }, &vsum);                               // row sum
             for (int64_t r = 0; r < M; r++) {
                 if (row_sum[r] == 0.0f) {
                     row_sum[r] = 1.0f;
                 }
             }
-            fns[7](tmp.data(), row_sum.data(), tmp.data());                               // P
-            ggml_xtc_call_unary(fns[8], tmp.data(), p16.data());                          // F16(P)
-            fns[9](p16.data(), (void *) vp, O.data());                                    // out = P.V
+            ggml_xtc_invoke(*fns[7], { &vtmp, &vsum }, &vtmp);                        // P
+            ggml_xtc_invoke(*fns[8], { &vtmp }, &vp16);                               // F16(P)
+            ggml_xtc_invoke(*fns[9], { &vp16, &vv }, &vO);                            // out = P.V
 
             for (int64_t r = 0; r < M; r++) {
                 const int64_t h = g * rk2 + r / n_tok;
@@ -1165,7 +1311,7 @@ static enum ggml_status ggml_backend_xtc_graph_compute(ggml_backend_t backend, s
 
     // pass 1: resolve every kernel *before* computing anything, so that a missing kernel
     // fails the whole graph cleanly (and we can report all the missing ones at once)
-    std::vector<std::vector<ggml_xtc_kernel_fn>> fns(cgraph->n_nodes);
+    std::vector<std::vector<const ggml_xtc_kernel *>> fns(cgraph->n_nodes);
     std::vector<ggml_xtc_missing_entry>  missing;
     std::vector<std::string>             broken;
     {
@@ -1189,7 +1335,7 @@ static enum ggml_status ggml_backend_xtc_graph_compute(ggml_backend_t backend, s
                 const ggml_xtc_kernel & k = ggml_xtc_get_kernel(shape);
                 switch (k.state) {
                     case ggml_xtc_kernel_state::FOUND:
-                        fns[i].push_back(k.fn);
+                        fns[i].push_back(&k);
                         break;
                     case ggml_xtc_kernel_state::BROKEN:
                         broken.push_back(k.key + ": " + k.error);
@@ -1230,7 +1376,7 @@ static enum ggml_status ggml_backend_xtc_graph_compute(ggml_backend_t backend, s
         if (fns[i].empty()) {
             ggml_xtc_run_lib_op(node);
         } else if (node->op == GGML_OP_MUL_MAT) {
-            ggml_xtc_run_mul_mat_kernel(fns[i][0], node);
+            ggml_xtc_run_mul_mat_kernel(*fns[i][0], node);
         } else if (node->op == GGML_OP_ROPE) {
             ggml_xtc_run_rope_kernels(fns[i], node);
         } else if (node->op == GGML_OP_FLASH_ATTN_EXT) {
@@ -1242,7 +1388,7 @@ static enum ggml_status ggml_backend_xtc_graph_compute(ggml_backend_t backend, s
         } else if (node->op == GGML_OP_SET_ROWS) {
             ggml_xtc_run_set_rows_kernels(fns[i], node);
         } else {
-            ggml_xtc_run_eltwise_kernel(fns[i][0], node);
+            ggml_xtc_run_eltwise_kernel(*fns[i][0], node);
         }
     }
 
