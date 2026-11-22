@@ -115,39 +115,41 @@ bool ggml_xtc_kop_is_matmul(ggml_xtc_kop kop) {
 
 ggml_xtc_kernel_desc ggml_xtc_describe(const ggml_xtc_kernel_shape & s) {
     ggml_xtc_kernel_desc d;
+    const char * dt = s.f16 ? "float16" : "float32"; // dtype of the data
     switch (s.kop) {
         case XTC_KOP_MATMUL:
-            d.inputs = { { "float32", s.m, s.k, false }, { "float32", s.k, s.n, true } };
+            d.inputs = { { dt, s.m, s.k, false }, { dt, s.k, s.n, true } };
+            d.attr_dtype = s.f16 ? "float16" : nullptr;
             break;
         case XTC_KOP_MATMUL_F16_BT:
             d.inputs = { { "float16", s.m, s.k, false }, { "float16", s.k, s.n, true } };
-            d.attr_dtype = "float32";
+            d.attr_dtype = dt;
             break;
         case XTC_KOP_MATMUL_F16:
             d.inputs = { { "float16", s.m, s.k, false }, { "float16", s.k, s.n, false } };
-            d.attr_dtype = "float32";
+            d.attr_dtype = dt;
             break;
         case XTC_KOP_ADD:
         case XTC_KOP_MUL:
-            d.inputs = { { "float32", s.m, s.n, false }, { "float32", s.m, s.n, false } };
+            d.inputs = { { dt, s.m, s.n, false }, { dt, s.m, s.n, false } };
             break;
         case XTC_KOP_RSQRT:
         case XTC_KOP_SILU:
         case XTC_KOP_EXP:
         case XTC_KOP_REDUCE_MAX:
         case XTC_KOP_REDUCE_SUM:
-            d.inputs = { { "float32", s.m, s.n, false } };
+            d.inputs = { { dt, s.m, s.n, false } };
             break;
         case XTC_KOP_CAST_F16:
-            d.inputs = { { "float32", s.m, s.n, false } };
+            d.inputs = { { dt, s.m, s.n, false } };
             d.attr_dtype = "float16";
             break;
         case XTC_KOP_SUB_ROW:
         case XTC_KOP_DIV_ROW:
-            d.inputs = { { "float32", s.m, s.n, false }, { "float32", s.m, 0, false } };
+            d.inputs = { { dt, s.m, s.n, false }, { dt, s.m, 0, false } };
             break;
         case XTC_KOP_FMA:
-            d.inputs = { { "float32", s.m, s.n, false }, { "float32", s.m, s.n, false }, { "float32", s.m, s.n, false } };
+            d.inputs = { { dt, s.m, s.n, false }, { dt, s.m, s.n, false }, { dt, s.m, s.n, false } };
             break;
     }
     return d;
@@ -157,10 +159,10 @@ std::string ggml_xtc_shape_str(const ggml_xtc_kernel_shape & s) {
     char buf[128];
     if (ggml_xtc_kop_is_matmul(s.kop)) {
         snprintf(buf, sizeof(buf), "%s%s M=%" PRId64 " N=%" PRId64 " K=%" PRId64, ggml_xtc_op_name(s.kop),
-                 s.kop == XTC_KOP_MATMUL ? " f32" : " f16->f32", s.m, s.n, s.k);
+                 s.f16 ? " f16" : s.kop == XTC_KOP_MATMUL ? " f32" : " f16->f32", s.m, s.n, s.k);
     } else {
-        snprintf(buf, sizeof(buf), "%s f32%s M=%" PRId64 " N=%" PRId64, ggml_xtc_op_name(s.kop),
-                 s.kop == XTC_KOP_CAST_F16 ? "->f16" : "", s.m, s.n);
+        snprintf(buf, sizeof(buf), "%s %s%s M=%" PRId64 " N=%" PRId64, ggml_xtc_op_name(s.kop), s.f16 ? "f16" : "f32",
+                 s.kop == XTC_KOP_CAST_F16 && !s.f16 ? "->f16" : "", s.m, s.n);
     }
     return buf;
 }
@@ -418,7 +420,7 @@ bool ggml_xtc_is_flat_eltwise(const struct ggml_tensor * op) {
 bool ggml_xtc_flat_rows(const struct ggml_tensor * op) {
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         const struct ggml_tensor * src = op->src[i];
-        if (src != nullptr && src->type == GGML_TYPE_F32 && src->ne[0] > 1 && !ggml_is_contiguous(src)) {
+        if (src != nullptr && (src->type == GGML_TYPE_F32 || src->type == GGML_TYPE_F16) && src->ne[0] > 1 && !ggml_is_contiguous(src)) {
             return false;
         }
     }
@@ -512,7 +514,18 @@ bool ggml_xtc_f32_rows(const struct ggml_tensor * t) {
     return t != nullptr && t->type == GGML_TYPE_F32 && t->nb[0] == sizeof(float);
 }
 
-bool ggml_xtc_lib_supports_op(const struct ggml_tensor * op) {
+bool ggml_xtc_f16_rows(const struct ggml_tensor * t) {
+    return t != nullptr && t->type == GGML_TYPE_F16 && t->nb[0] == sizeof(uint16_t);
+}
+
+// packed rows of the activation type: F32 for the XTC backends, F16 for the F16 nodes of XTC_MPPA
+static bool ggml_xtc_act_rows(const struct ggml_tensor * t, ggml_type type) {
+    return type == GGML_TYPE_F16 ? ggml_xtc_f16_rows(t) : ggml_xtc_f32_rows(t);
+}
+
+// act: type of the activations (F32 or F16). F16: the attention output stays F32 (ggml definition) and SET_ROWS only
+// writes an F16 cache.
+static bool ggml_xtc_lib_supports_op_t(const struct ggml_tensor * op, ggml_type act) {
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
     const struct ggml_tensor * src2 = op->src[2];
@@ -523,17 +536,17 @@ bool ggml_xtc_lib_supports_op(const struct ggml_tensor * op) {
 
     switch (op->op) {
         case GGML_OP_RMS_NORM:
-            return ggml_xtc_f32_rows(src0) && ggml_xtc_f32_rows(op) && ggml_are_same_shape(src0, op);
+            return ggml_xtc_act_rows(src0, act) && ggml_xtc_act_rows(op, act) && ggml_are_same_shape(src0, op);
 
         case GGML_OP_ADD:
         case GGML_OP_MUL:
-            return ggml_xtc_f32_rows(src0) && ggml_xtc_f32_rows(src1) && ggml_xtc_f32_rows(op) &&
+            return ggml_xtc_act_rows(src0, act) && ggml_xtc_act_rows(src1, act) && ggml_xtc_act_rows(op, act) &&
                    ggml_are_same_shape(src0, op) && ggml_can_repeat(src1, src0);
 
         case GGML_OP_GLU:
             // split SWIGLU only (gate = src0, up = src1)
             return ggml_get_glu_op(op) == GGML_GLU_OP_SWIGLU && ggml_get_op_params_i32(op, 1) == 0 &&
-                   ggml_xtc_f32_rows(src0) && ggml_xtc_f32_rows(src1) && ggml_xtc_f32_rows(op) &&
+                   ggml_xtc_act_rows(src0, act) && ggml_xtc_act_rows(src1, act) && ggml_xtc_act_rows(op, act) &&
                    ggml_are_same_shape(src0, src1) && ggml_are_same_shape(src0, op);
 
         case GGML_OP_ROPE: {
@@ -541,7 +554,7 @@ bool ggml_xtc_lib_supports_op(const struct ggml_tensor * op) {
             const int   mode   = ggml_get_op_params_i32(op, 2);
             float ext_factor;
             memcpy(&ext_factor, (const int32_t *) op->op_params + 7, sizeof(float));
-            return ggml_xtc_f32_rows(src0) && ggml_xtc_f32_rows(op) && ggml_are_same_shape(src0, op) &&
+            return ggml_xtc_act_rows(src0, act) && ggml_xtc_act_rows(op, act) && ggml_are_same_shape(src0, op) &&
                    src1 != nullptr && src1->type == GGML_TYPE_I32 && src1->ne[0] == src0->ne[2] &&
                    (mode == GGML_ROPE_TYPE_NORMAL || mode == GGML_ROPE_TYPE_NEOX) &&
                    ext_factor == 0.0f && ggml_get_op_params_i32(op, 15) == 0 &&
@@ -550,8 +563,8 @@ bool ggml_xtc_lib_supports_op(const struct ggml_tensor * op) {
         }
 
         case GGML_OP_SET_ROWS:
-            return ggml_xtc_f32_rows(src0) && src1 != nullptr && src1->type == GGML_TYPE_I64 &&
-                   (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32) &&
+            return ggml_xtc_act_rows(src0, act) && src1 != nullptr && src1->type == GGML_TYPE_I64 &&
+                   (op->type == GGML_TYPE_F16 || (act == GGML_TYPE_F32 && op->type == GGML_TYPE_F32)) &&
                    op->nb[0] == ggml_type_size(op->type) && op->ne[0] == src0->ne[0] &&
                    op->ne[2] == src0->ne[2] && op->ne[3] == src0->ne[3] &&
                    src0->ne[2] % src1->ne[1] == 0 && src0->ne[3] % src1->ne[2] == 0 &&
@@ -569,7 +582,7 @@ bool ggml_xtc_lib_supports_op(const struct ggml_tensor * op) {
                     return false;
                 }
             }
-            return ggml_xtc_f32_rows(src0) && ggml_xtc_f32_rows(op) &&
+            return ggml_xtc_act_rows(src0, act) && ggml_xtc_f32_rows(op) &&
                    k != nullptr && v != nullptr && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
                    k->nb[0] == sizeof(uint16_t) && v->nb[0] == sizeof(uint16_t) &&
                    max_bias == 0.0f && softcap == 0.0f &&
@@ -584,6 +597,114 @@ bool ggml_xtc_lib_supports_op(const struct ggml_tensor * op) {
         default:
             return false;
     }
+}
+
+bool ggml_xtc_lib_supports_op(const struct ggml_tensor * op) {
+    return ggml_xtc_lib_supports_op_t(op, GGML_TYPE_F32);
+}
+
+bool ggml_xtc_is_flat_eltwise_f16(const struct ggml_tensor * op) {
+    const struct ggml_tensor * src0 = op->src[0];
+    const struct ggml_tensor * src1 = op->src[1];
+    return src0 != nullptr && src1 != nullptr && src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F16 &&
+           op->type == GGML_TYPE_F16 && ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(op) &&
+           ggml_are_same_shape(src0, src1) && ggml_are_same_shape(src0, op);
+}
+
+std::vector<ggml_xtc_kernel_shape> ggml_xtc_node_kernels_f16(const struct ggml_tensor * op) {
+    std::vector<ggml_xtc_kernel_shape> out;
+    const struct ggml_tensor * src0 = op->src[0];
+    const struct ggml_tensor * src1 = op->src[1];
+    if (src0 == nullptr) {
+        return out;
+    }
+    auto k = [](ggml_xtc_kop kop, int64_t m, int64_t n, int64_t kk = 0, bool f16 = true) {
+        ggml_xtc_kernel_shape s;
+        s.kop = kop; s.m = m; s.n = n; s.k = kk; s.f16 = f16;
+        return s;
+    };
+
+    switch (op->op) {
+        case GGML_OP_MUL_MAT:
+            // F16 weight x F16 input -> F32 output: the F16 x F16 -> F32 kernel, B (the weight) transposed
+            if (src0->type == GGML_TYPE_F16 && src1 != nullptr && src1->type == GGML_TYPE_F16 &&
+                op->type == GGML_TYPE_F32 && src0->buffer != nullptr &&
+                ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(op) &&
+                ggml_nelements(op) > 0 && ggml_nelements(src0) > 0 && ggml_nelements(src1) > 0 &&
+                src1->ne[2] % src0->ne[2] == 0 && src1->ne[3] % src0->ne[3] == 0) {
+                out.push_back(k(XTC_KOP_MATMUL_F16_BT, src1->ne[1], src0->ne[1], src0->ne[0], false));
+            }
+            break;
+        case GGML_OP_ADD:
+        case GGML_OP_MUL: {
+            const ggml_xtc_kop kop = op->op == GGML_OP_ADD ? XTC_KOP_ADD : XTC_KOP_MUL;
+            if (ggml_nelements(op) > 0 && ggml_xtc_is_flat_eltwise_f16(op)) {
+                out.push_back(k(kop, op->ne[1] * op->ne[2] * op->ne[3], op->ne[0]));
+            } else if (ggml_xtc_lib_supports_op_t(op, GGML_TYPE_F16) && src1->ne[0] == op->ne[0]) {
+                out.push_back(k(kop, 1, op->ne[0]));
+            }
+            break;
+        }
+        case GGML_OP_ROPE:
+            if (ggml_xtc_lib_supports_op_t(op, GGML_TYPE_F16) && src0->nb[1] == src0->ne[0] * sizeof(uint16_t) &&
+                op->nb[1] == op->ne[0] * sizeof(uint16_t)) {
+                const int64_t H = op->ne[1], D = op->ne[0];
+                out.push_back(k(XTC_KOP_MATMUL, H, D, D));
+                out.push_back(k(XTC_KOP_MUL, H, D));
+                out.push_back(k(XTC_KOP_FMA, H, D));
+            }
+            break;
+        case GGML_OP_RMS_NORM:
+            if (ggml_xtc_lib_supports_op_t(op, GGML_TYPE_F16)) {
+                const int64_t M = ggml_xtc_flat_rows(op) ? ggml_nrows(op) : 1;
+                const int64_t N = op->ne[0];
+                out.push_back(k(XTC_KOP_MUL, M, N));
+                out.push_back(k(XTC_KOP_MATMUL, M, 1, N));
+                out.push_back(k(XTC_KOP_ADD, M, 1));
+                out.push_back(k(XTC_KOP_RSQRT, M, 1));
+                out.push_back(k(XTC_KOP_MATMUL, M, N, 1));
+                out.push_back(k(XTC_KOP_MUL, M, N));
+            }
+            break;
+        case GGML_OP_GLU:
+            if (ggml_xtc_lib_supports_op_t(op, GGML_TYPE_F16)) {
+                const int64_t M = ggml_xtc_flat_rows(op) ? ggml_nrows(op) : 1;
+                out.push_back(k(XTC_KOP_SILU, M, op->ne[0]));
+                out.push_back(k(XTC_KOP_MUL, M, op->ne[0]));
+            }
+            break;
+        case GGML_OP_SET_ROWS:
+            if (ggml_xtc_lib_supports_op_t(op, GGML_TYPE_F16)) {
+                out.push_back(k(XTC_KOP_CAST_F16, 1, op->ne[0]));
+            }
+            break;
+        case GGML_OP_FLASH_ATTN_EXT:
+            if (ggml_xtc_lib_supports_op_t(op, GGML_TYPE_F16) && src1->ne[1] > 0) {
+                const int64_t M = (src0->ne[2] / src1->ne[2]) * src0->ne[1];
+                const int64_t D = src0->ne[0];
+                const int64_t N = src1->ne[1];
+                out.push_back(k(XTC_KOP_MATMUL_F16_BT, M, N, D));
+                out.push_back(k(XTC_KOP_FMA, M, N));
+                out.push_back(k(XTC_KOP_REDUCE_MAX, M, N));
+                out.push_back(k(XTC_KOP_SUB_ROW, M, N));
+                out.push_back(k(XTC_KOP_EXP, M, N));
+                out.push_back(k(XTC_KOP_REDUCE_SUM, M, N));
+                out.push_back(k(XTC_KOP_DIV_ROW, M, N));
+                out.push_back(k(XTC_KOP_MATMUL_F16, M, D, N));
+            }
+            break;
+        case GGML_OP_CPY:
+            // F32 -> F16 cast of a packed tensor: the cast after a F32 output (MUL_MAT, FLASH_ATTN_EXT)
+            if (src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F16 && ggml_nelements(op) > 0 &&
+                ggml_is_contiguous(src0) && ggml_is_contiguous(op) && ggml_are_same_shape(src0, op)) {
+                out.push_back(k(XTC_KOP_CAST_F16, ggml_nrows(op), op->ne[0], 0, false));
+            }
+            break;
+        default:
+            break;
+    }
+    return out;
 }
 
 //

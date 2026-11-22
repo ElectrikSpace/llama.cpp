@@ -25,7 +25,8 @@ namespace fs = std::filesystem;
 // (xtc/src/xtc/csrcs/runtimes/accelerator/mppa/host.c), loaded from XTC_MPPA_RUNTIME.
 // Compute: the nodes that ggml_xtc_node_kernels splits into kernels run on device memory, one runner per op
 // (see ggml_xtc_mppa_has_runner): MUL_MAT, ADD/MUL (flat, row broadcast, strided rows), RMS_NORM, SWIGLU,
-// ROPE, F16 SET_ROWS and FLASH_ATTN_EXT. Glue work (constants, index reads, gathers, fix-ups) is staged through
+// ROPE, F16 SET_ROWS and FLASH_ATTN_EXT, and the F16 flavours of them (F16 activations and weights, see
+// ggml_xtc_node_kernels_f16) with the F32 -> F16 CPY after the F32 outputs of MUL_MAT and FLASH_ATTN_EXT. Glue work (constants, index reads, gathers, fix-ups) is staged through
 // the host into a per-backend device scratch area. Other operators are not claimed and there is no fallback:
 // the scheduler runs them on another backend.
 
@@ -343,7 +344,7 @@ private:
 
 // MPPA kernels: kernel.so of a kernel base entry built for the mppa target (KernelBase.add(target="mppa")).
 // Like MppaDevice, at most GGML_XTC_MPPA_MAX_KERNELS are loaded at once.
-static constexpr size_t GGML_XTC_MPPA_MAX_KERNELS = 10;
+static constexpr size_t GGML_XTC_MPPA_MAX_KERNELS = 32;
 
 struct ggml_xtc_mppa_kernel {
     void *             lib      = nullptr;
@@ -436,10 +437,22 @@ static bool ggml_xtc_mppa_has_runner(const struct ggml_tensor * op) {
         case GGML_OP_ROPE:
         case GGML_OP_SET_ROWS:
         case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_CPY:
             return true;
         default:
             return false;
     }
+}
+
+// Kernels of a node: those of its F16 flavour, else the F32 ones
+static std::vector<ggml_xtc_kernel_shape> ggml_xtc_mppa_node_kernels(const struct ggml_tensor * op) {
+    std::vector<ggml_xtc_kernel_shape> shapes = ggml_xtc_node_kernels_f16(op);
+    return shapes.empty() ? ggml_xtc_node_kernels(op) : shapes;
+}
+
+// F16 flavour of a node (F16 activations): its kernels and runners work on 2-byte elements
+static bool ggml_xtc_mppa_is_f16(const struct ggml_tensor * op) {
+    return !ggml_xtc_node_kernels_f16(op).empty();
 }
 
 // A node is claimed when it is a view or a leaf, or when it runs as kernels with a runner
@@ -447,7 +460,7 @@ static bool ggml_xtc_mppa_supports(const struct ggml_tensor * op) {
     if (ggml_op_is_empty(op->op)) {
         return true;
     }
-    return ggml_xtc_mppa_has_runner(op) && !ggml_xtc_node_kernels(op).empty();
+    return ggml_xtc_mppa_has_runner(op) && !ggml_xtc_mppa_node_kernels(op).empty();
 }
 
 // Calls a kernel on device addresses: inputs first, then the output (2 to 4 pointers, like ggml_xtc_invoke)
@@ -501,7 +514,7 @@ static void ggml_xtc_mppa_run_add_mul(ggml_xtc_mppa_context & ctx, const std::ve
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
 
-    if (ggml_xtc_is_flat_eltwise(dst)) {
+    if (ggml_xtc_is_flat_eltwise(dst) || ggml_xtc_is_flat_eltwise_f16(dst)) {
         const uintptr_t a = ggml_xtc_mppa_dev_addr(src0);
         const uintptr_t b = ggml_xtc_mppa_dev_addr(src1);
         const uintptr_t d = ggml_xtc_mppa_dev_addr(dst);
@@ -526,6 +539,39 @@ static void ggml_xtc_mppa_run_add_mul(ggml_xtc_mppa_context & ctx, const std::ve
 // byte offset of row (i1, i2, i3) of t
 static size_t ggml_xtc_mppa_row_off(const struct ggml_tensor * t, int64_t i1, int64_t i2, int64_t i3) {
     return i1 * t->nb[1] + i2 * t->nb[2] + i3 * t->nb[3];
+}
+
+// element size of the activations of a node: 2 for the F16 flavour, else 4
+static size_t ggml_xtc_mppa_elem_size(bool f16) {
+    return f16 ? sizeof(ggml_fp16_t) : sizeof(float);
+}
+
+// host floats written to the device as F16 or F32 elements, at a scratch address
+static void ggml_xtc_mppa_write_elems(ggml_xtc_mppa_context & ctx, uintptr_t dev, const std::vector<float> & v, bool f16) {
+    if (f16) {
+        std::vector<ggml_fp16_t> h(v.size());
+        ggml_fp32_to_fp16_row(v.data(), h.data(), (int64_t) v.size());
+        ctx.write(dev, h.data(), h.size() * sizeof(ggml_fp16_t));
+    } else {
+        ctx.write(dev, v.data(), v.size() * sizeof(float));
+    }
+}
+
+static uintptr_t ggml_xtc_mppa_upload_elems(ggml_xtc_mppa_context & ctx, const std::vector<float> & v, bool f16) {
+    const uintptr_t dev = ctx.alloc(v.size() * ggml_xtc_mppa_elem_size(f16));
+    ggml_xtc_mppa_write_elems(ctx, dev, v, f16);
+    return dev;
+}
+
+// device F16 or F32 elements read as host floats
+static void ggml_xtc_mppa_download_elems(const ggml_xtc_mppa_context & ctx, uintptr_t dev, std::vector<float> & v, bool f16) {
+    if (f16) {
+        std::vector<ggml_fp16_t> h(v.size());
+        ctx.download(dev, h.data(), h.size() * sizeof(ggml_fp16_t));
+        ggml_fp16_to_fp32_row(h.data(), v.data(), (int64_t) v.size());
+    } else {
+        ctx.download(dev, v.data(), v.size() * sizeof(float));
+    }
 }
 
 // calls f once for the whole node when it is flat, else once per row of dst (see ggml_xtc_for_each_chunk)
@@ -554,19 +600,21 @@ static void ggml_xtc_mppa_run_rms_norm(ggml_xtc_mppa_context & ctx, const std::v
 
     const int64_t N = dst->ne[0];
     const int64_t M = ggml_xtc_flat_rows(dst) ? ggml_nrows(dst) : 1;
+    const bool f16 = ggml_xtc_mppa_is_f16(dst);
+    const size_t es = ggml_xtc_mppa_elem_size(f16);
     const std::vector<float> inv_n(N, 1.0f / (float) N), ones(N, 1.0f), eps_v(M, eps);
 
     ctx.reset();
-    ctx.reserve(2 * ggml_xtc_mppa_align(N * sizeof(float)) + 4 * ggml_xtc_mppa_align(M * sizeof(float)) +
-                2 * ggml_xtc_mppa_align(M * N * sizeof(float)));
-    const uintptr_t d_inv_n    = ctx.upload(inv_n.data(), N * sizeof(float));
-    const uintptr_t d_ones     = ctx.upload(ones.data(), N * sizeof(float));
-    const uintptr_t d_eps      = ctx.upload(eps_v.data(), M * sizeof(float));
-    const uintptr_t d_sq       = ctx.alloc(M * N * sizeof(float));
-    const uintptr_t d_mean     = ctx.alloc(M * sizeof(float));
-    const uintptr_t d_mean_eps = ctx.alloc(M * sizeof(float));
-    const uintptr_t d_rs       = ctx.alloc(M * sizeof(float));
-    const uintptr_t d_bc       = ctx.alloc(M * N * sizeof(float));
+    ctx.reserve(2 * ggml_xtc_mppa_align(N * es) + 4 * ggml_xtc_mppa_align(M * es) +
+                2 * ggml_xtc_mppa_align(M * N * es));
+    const uintptr_t d_inv_n    = ggml_xtc_mppa_upload_elems(ctx, inv_n, f16);
+    const uintptr_t d_ones     = ggml_xtc_mppa_upload_elems(ctx, ones, f16);
+    const uintptr_t d_eps      = ggml_xtc_mppa_upload_elems(ctx, eps_v, f16);
+    const uintptr_t d_sq       = ctx.alloc(M * N * es);
+    const uintptr_t d_mean     = ctx.alloc(M * es);
+    const uintptr_t d_mean_eps = ctx.alloc(M * es);
+    const uintptr_t d_rs       = ctx.alloc(M * es);
+    const uintptr_t d_bc       = ctx.alloc(M * N * es);
 
     ggml_xtc_mppa_for_each_chunk(dst, [&](int64_t i1, int64_t i2, int64_t i3) {
         const uintptr_t x   = ggml_xtc_mppa_dev_addr(src0, ggml_xtc_mppa_row_off(src0, i1, i2, i3));
@@ -589,8 +637,8 @@ static void ggml_xtc_mppa_run_swiglu(ggml_xtc_mppa_context & ctx, const std::vec
     const int64_t M = ggml_xtc_flat_rows(dst) ? ggml_nrows(dst) : 1;
 
     ctx.reset();
-    ctx.reserve(ggml_xtc_mppa_align(M * N * sizeof(float)));
-    const uintptr_t tmp = ctx.alloc(M * N * sizeof(float));
+    ctx.reserve(ggml_xtc_mppa_align(M * N * ggml_xtc_mppa_elem_size(ggml_xtc_mppa_is_f16(dst))));
+    const uintptr_t tmp = ctx.alloc(M * N * ggml_xtc_mppa_elem_size(ggml_xtc_mppa_is_f16(dst)));
 
     ggml_xtc_mppa_for_each_chunk(dst, [&](int64_t i1, int64_t i2, int64_t i3) {
         const uintptr_t g   = ggml_xtc_mppa_dev_addr(gate, ggml_xtc_mppa_row_off(gate, i1, i2, i3));
@@ -626,13 +674,15 @@ static void ggml_xtc_mppa_run_rope(ggml_xtc_mppa_context & ctx, const std::vecto
         ggml_xtc_mppa_tensor_read(src2, 0, ff.data(), ff.size() * sizeof(float));
     }
 
+    const bool f16 = ggml_xtc_mppa_is_f16(dst);
+    const size_t es = ggml_xtc_mppa_elem_size(f16);
     std::vector<float> swap(D * D), c(D), s(D), C(H * D), S(H * D);
     xtc_rope_swap_matrix(&p, D, swap.data());
 
-    const size_t hd = H * D * sizeof(float);
+    const size_t hd = H * D * es;
     ctx.reset();
-    ctx.reserve(ggml_xtc_mppa_align(D * D * sizeof(float)) + 4 * ggml_xtc_mppa_align(hd));
-    const uintptr_t d_swap = ctx.upload(swap.data(), D * D * sizeof(float));
+    ctx.reserve(ggml_xtc_mppa_align(D * D * es) + 4 * ggml_xtc_mppa_align(hd));
+    const uintptr_t d_swap = ggml_xtc_mppa_upload_elems(ctx, swap, f16);
     const uintptr_t t1     = ctx.alloc(hd);
     const uintptr_t t2     = ctx.alloc(hd);
     const uintptr_t d_C    = ctx.alloc(hd);
@@ -645,8 +695,8 @@ static void ggml_xtc_mppa_run_rope(ggml_xtc_mppa_context & ctx, const std::vecto
                 memcpy(&C[h * D], c.data(), D * sizeof(float));
                 memcpy(&S[h * D], s.data(), D * sizeof(float));
             }
-            ctx.write(d_C, C.data(), hd);
-            ctx.write(d_S, S.data(), hd);
+            ggml_xtc_mppa_write_elems(ctx, d_C, C, f16);
+            ggml_xtc_mppa_write_elems(ctx, d_S, S, f16);
 
             // invoke is synchronous, so one slot of C and S is reused for all tokens
             const uintptr_t x   = ggml_xtc_mppa_dev_addr(src0, ggml_xtc_mppa_row_off(src0, 0, i2, i3));
@@ -810,6 +860,115 @@ static void ggml_xtc_mppa_run_flash_attn(ggml_xtc_mppa_context & ctx, const std:
     }
 }
 
+// F16 FLASH_ATTN_EXT (ggml_xtc_node_kernels_f16): as above, but Q is already F16 and the scores, the softmax and P
+// stay F16 on the device; the F32 output is converted on the host. Row max and sum are fixed up on the host.
+static void ggml_xtc_mppa_run_flash_attn_f16(ggml_xtc_mppa_context & ctx, const std::vector<const ggml_xtc_mppa_kernel *> & fns,
+                                             struct ggml_tensor * dst) {
+    const struct ggml_tensor * q    = dst->src[0];
+    const struct ggml_tensor * k    = dst->src[1];
+    const struct ggml_tensor * v    = dst->src[2];
+    const struct ggml_tensor * mask = dst->src[3];
+    float scale;
+    memcpy(&scale, dst->op_params, sizeof(float));
+
+    const int64_t D     = q->ne[0];
+    const int64_t n_tok = q->ne[1];
+    const int64_t n_kv  = k->ne[1];
+    const int64_t rk2   = q->ne[2] / k->ne[2];
+    const int64_t M     = rk2 * n_tok;
+
+    const bool k_packed = k->nb[1] == D * sizeof(ggml_fp16_t);
+    const bool v_packed = v->nb[1] == D * sizeof(ggml_fp16_t);
+
+    const size_t q_b   = M * D * sizeof(ggml_fp16_t);
+    const size_t s_b   = M * n_kv * sizeof(ggml_fp16_t);
+    const size_t row_b = M * sizeof(ggml_fp16_t);
+    const size_t kv_b  = n_kv * D * sizeof(ggml_fp16_t);
+
+    std::vector<float>       scale_v(M * n_kv, scale), row_max(M), row_sum(M), O(M * D);
+    std::vector<ggml_fp16_t> q_h(M * D), mask_h(M * n_kv, ggml_fp32_to_fp16(0.0f)), o_h(M * D);
+    std::vector<ggml_fp16_t> k_g(k_packed ? 0 : n_kv * D), v_g(v_packed ? 0 : n_kv * D);
+
+    ctx.reset();
+    ctx.reserve(2 * ggml_xtc_mppa_align(q_b) + 4 * ggml_xtc_mppa_align(s_b) + 2 * ggml_xtc_mppa_align(kv_b) +
+                2 * ggml_xtc_mppa_align(row_b));
+    const uintptr_t d_q     = ctx.alloc(q_b);
+    const uintptr_t d_mask  = ctx.alloc(s_b);
+    const uintptr_t d_scale = ggml_xtc_mppa_upload_elems(ctx, scale_v, true);
+    const uintptr_t d_S     = ctx.alloc(s_b);
+    const uintptr_t d_tmp   = ctx.alloc(s_b);
+    const uintptr_t d_max   = ctx.alloc(row_b);
+    const uintptr_t d_sum   = ctx.alloc(row_b);
+    const uintptr_t d_O     = ctx.alloc(q_b);
+    const uintptr_t d_k     = ctx.alloc(kv_b);
+    const uintptr_t d_v     = ctx.alloc(kv_b);
+    ctx.write(d_mask, mask_h.data(), s_b); // zeros when there is no mask
+
+    auto kv_addr = [&](const struct ggml_tensor * t, bool packed, uintptr_t dev, std::vector<ggml_fp16_t> & host,
+                       size_t off) {
+        if (packed) {
+            return ggml_xtc_mppa_dev_addr(t, off);
+        }
+        for (int64_t j = 0; j < n_kv; j++) {
+            ggml_xtc_mppa_tensor_read(t, off + j * t->nb[1], &host[j * D], D * sizeof(ggml_fp16_t));
+        }
+        ctx.write(dev, host.data(), kv_b);
+        return dev;
+    };
+
+    for (int64_t s = 0; s < q->ne[3]; s++) {
+        for (int64_t g = 0; g < k->ne[2]; g++) {
+            for (int64_t r = 0; r < M; r++) {
+                const int64_t h = g * rk2 + r / n_tok;
+                const int64_t t = r % n_tok;
+                ggml_xtc_mppa_tensor_read(q, t * q->nb[1] + h * q->nb[2] + s * q->nb[3], &q_h[r * D], D * sizeof(ggml_fp16_t));
+                if (mask != nullptr) {
+                    ggml_xtc_mppa_tensor_read(mask, t * mask->nb[1] + (h % mask->ne[2]) * mask->nb[2] +
+                                              (s % mask->ne[3]) * mask->nb[3], &mask_h[r * n_kv], n_kv * sizeof(ggml_fp16_t));
+                }
+            }
+            ctx.write(d_q, q_h.data(), q_b);
+            if (mask != nullptr) {
+                ctx.write(d_mask, mask_h.data(), s_b);
+            }
+
+            const uintptr_t d_kk = kv_addr(k, k_packed, d_k, k_g, g * k->nb[2] + s * k->nb[3]);
+            const uintptr_t d_vv = kv_addr(v, v_packed, d_v, v_g, g * v->nb[2] + s * v->nb[3]);
+
+            ggml_xtc_mppa_invoke(*fns[0], { d_q, d_kk, d_S });              // S = Q.K^T
+            ggml_xtc_mppa_invoke(*fns[1], { d_S, d_scale, d_mask, d_S });   // S = S * scale + mask
+            ggml_xtc_mppa_invoke(*fns[2], { d_S, d_max });                  // row max
+            ggml_xtc_mppa_download_elems(ctx, d_max, row_max, true);
+            for (int64_t r = 0; r < M; r++) {
+                if (row_max[r] == -INFINITY) { // fully masked row: exp(-inf) = 0 and a zero output
+                    row_max[r] = 0.0f;
+                }
+            }
+            ggml_xtc_mppa_write_elems(ctx, d_max, row_max, true);
+            ggml_xtc_mppa_invoke(*fns[3], { d_S, d_max, d_tmp });           // S - max
+            ggml_xtc_mppa_invoke(*fns[4], { d_tmp, d_tmp });                // exp
+            ggml_xtc_mppa_invoke(*fns[5], { d_tmp, d_sum });                // row sum
+            ggml_xtc_mppa_download_elems(ctx, d_sum, row_sum, true);
+            for (int64_t r = 0; r < M; r++) {
+                if (row_sum[r] == 0.0f) {
+                    row_sum[r] = 1.0f;
+                }
+            }
+            ggml_xtc_mppa_write_elems(ctx, d_sum, row_sum, true);
+            ggml_xtc_mppa_invoke(*fns[6], { d_tmp, d_sum, d_tmp });         // P
+            ggml_xtc_mppa_invoke(*fns[7], { d_tmp, d_vv, d_O });            // out = P.V
+            ctx.download(d_O, o_h.data(), q_b);
+            ggml_fp16_to_fp32_row(o_h.data(), O.data(), (int64_t) O.size());
+
+            for (int64_t r = 0; r < M; r++) {
+                const int64_t h = g * rk2 + r / n_tok;
+                const int64_t t = r % n_tok;
+                ggml_xtc_mppa_tensor_write(dst, h * dst->nb[1] + t * dst->nb[2] + s * dst->nb[3], &O[r * D], D * sizeof(float));
+            }
+        }
+    }
+}
+
 static enum ggml_status ggml_backend_xtc_mppa_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     std::lock_guard<std::mutex> lock(g_xtc_mppa_mutex);
     g_xtc_mppa_generation++;
@@ -824,7 +983,7 @@ static enum ggml_status ggml_backend_xtc_mppa_graph_compute(ggml_backend_t backe
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || ggml_op_is_empty(node->op)) {
             continue;
         }
-        const std::vector<ggml_xtc_kernel_shape> shapes = ggml_xtc_node_kernels(node);
+        const std::vector<ggml_xtc_kernel_shape> shapes = ggml_xtc_mppa_node_kernels(node);
         if (shapes.empty() || !ggml_xtc_mppa_has_runner(node)) {
             errors.push_back(std::string(ggml_op_desc(node)) + " (" + node->name + ") is not supported by XTC_MPPA");
             continue;
@@ -881,7 +1040,14 @@ static enum ggml_status ggml_backend_xtc_mppa_graph_compute(ggml_backend_t backe
                 ggml_xtc_mppa_run_set_rows(ctx, fns[i], node);
                 break;
             case GGML_OP_FLASH_ATTN_EXT:
-                ggml_xtc_mppa_run_flash_attn(ctx, fns[i], node);
+                if (ggml_xtc_mppa_is_f16(node)) {
+                    ggml_xtc_mppa_run_flash_attn_f16(ctx, fns[i], node);
+                } else {
+                    ggml_xtc_mppa_run_flash_attn(ctx, fns[i], node);
+                }
+                break;
+            case GGML_OP_CPY:
+                ggml_xtc_mppa_invoke(*fns[i][0], { ggml_xtc_mppa_dev_addr(node->src[0]), ggml_xtc_mppa_dev_addr(node) });
                 break;
             default:
                 GGML_ABORT("%s: unexpected op %s", __func__, ggml_op_name(node->op));

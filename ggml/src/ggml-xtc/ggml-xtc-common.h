@@ -31,11 +31,14 @@ enum ggml_xtc_kop {
     XTC_KOP_REDUCE_MAX, XTC_KOP_REDUCE_SUM, XTC_KOP_SUB_ROW, XTC_KOP_DIV_ROW,
 };
 
+// f16: F16 variant of the kernel: all inputs and the output are F16 (the MATMUL_F16* kinds get an F16 output, CAST_F16 is
+// an F16 -> F16 copy). Used by XTC_MPPA only (ggml_xtc_node_kernels_f16).
 struct ggml_xtc_kernel_shape {
     ggml_xtc_kop kop = XTC_KOP_MATMUL;
     int64_t m = 0, n = 0, k = 0; // k only for matmuls
+    bool f16 = false;
     bool operator<(const ggml_xtc_kernel_shape & o) const {
-        return std::tie(kop, m, n, k) < std::tie(o.kop, o.m, o.n, o.k);
+        return std::tie(kop, m, n, k, f16) < std::tie(o.kop, o.m, o.n, o.k, o.f16);
     }
 };
 
@@ -91,6 +94,18 @@ bool ggml_xtc_flat_rows(const struct ggml_tensor * op);
 
 // Kernels needed by a node, in call order. Empty when xtc_support_lib runs the node.
 std::vector<ggml_xtc_kernel_shape> ggml_xtc_node_kernels(const struct ggml_tensor * op);
+
+// Same for the F16 nodes of XTC_MPPA (F16 activations and weights; empty for any other node):
+//   MUL_MAT (F16 weight, F16 input, F32 output: F16 x F16 -> F32 kernel), ADD / MUL, RMS_NORM, SWIGLU, ROPE, SET_ROWS:
+//   the same kernels as ggml_xtc_node_kernels with the f16 flag; FLASH_ATTN_EXT with an F16 Q (F32 output, as ggml
+//   defines it): no Q cast, F16 scores; CPY F32 -> F16: one cast kernel.
+std::vector<ggml_xtc_kernel_shape> ggml_xtc_node_kernels_f16(const struct ggml_tensor * op);
+
+// F16 tensor with packed rows (nb[0] == sizeof(ggml_fp16_t)), false for null
+bool ggml_xtc_f16_rows(const struct ggml_tensor * t);
+
+// ADD / MUL whose inputs and output are contiguous F16 tensors of the same shape
+bool ggml_xtc_is_flat_eltwise_f16(const struct ggml_tensor * op);
 
 // F32 tensor with packed rows (nb[0] == sizeof(float)), false for null
 bool ggml_xtc_f32_rows(const struct ggml_tensor * t);
