@@ -110,7 +110,7 @@ const char * ggml_xtc_op_name(ggml_xtc_kop kop) {
 }
 
 bool ggml_xtc_kop_is_matmul(ggml_xtc_kop kop) {
-    return kop == XTC_KOP_MATMUL || kop == XTC_KOP_MATMUL_F16_BT || kop == XTC_KOP_MATMUL_F16;
+    return kop == XTC_KOP_MATMUL || kop == XTC_KOP_MATMUL_KN || kop == XTC_KOP_MATMUL_F16_BT || kop == XTC_KOP_MATMUL_F16;
 }
 
 ggml_xtc_kernel_desc ggml_xtc_describe(const ggml_xtc_kernel_shape & s) {
@@ -120,6 +120,9 @@ ggml_xtc_kernel_desc ggml_xtc_describe(const ggml_xtc_kernel_shape & s) {
         case XTC_KOP_MATMUL:
             d.inputs = { { dt, s.m, s.k, false }, { dt, s.k, s.n, true } };
             d.attr_dtype = s.f16 ? "float16" : nullptr;
+            break;
+        case XTC_KOP_MATMUL_KN:
+            d.inputs = { { "float32", s.m, s.k, false }, { "float32", s.k, s.n, false } };
             break;
         case XTC_KOP_MATMUL_F16_BT:
             d.inputs = { { "float16", s.m, s.k, false }, { "float16", s.k, s.n, true } };
@@ -159,7 +162,7 @@ std::string ggml_xtc_shape_str(const ggml_xtc_kernel_shape & s) {
     char buf[128];
     if (ggml_xtc_kop_is_matmul(s.kop)) {
         snprintf(buf, sizeof(buf), "%s%s M=%" PRId64 " N=%" PRId64 " K=%" PRId64, ggml_xtc_op_name(s.kop),
-                 s.f16 ? " f16" : s.kop == XTC_KOP_MATMUL ? " f32" : " f16->f32", s.m, s.n, s.k);
+                 s.f16 ? " f16" : (s.kop == XTC_KOP_MATMUL || s.kop == XTC_KOP_MATMUL_KN) ? " f32" : " f16->f32", s.m, s.n, s.k);
     } else {
         snprintf(buf, sizeof(buf), "%s %s%s M=%" PRId64 " N=%" PRId64, ggml_xtc_op_name(s.kop), s.f16 ? "f16" : "f32",
                  s.kop == XTC_KOP_CAST_F16 && !s.f16 ? "->f16" : "", s.m, s.n);

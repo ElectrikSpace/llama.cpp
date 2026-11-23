@@ -17,6 +17,8 @@
 
 // Kernel kinds. All of them are one XTC node on 2D row-major tensors, called with bare pointers (inputs..., output):
 //   MATMUL         C[m,n] = A[m,k] x B[k,n], F32, B stored transposed (see ggml_xtc_is_supported_matmul)
+//   MATMUL_KN      same as MATMUL with B stored (k,n) as is: XTC_MPPA keeps the F32 model weights transposed on the device
+//                  (see ggml_xtc_mppa_weight_kn), which lets the 8x8 microkernel run on them
 //   MATMUL_F16_BT  same with F16 A and B, F32 output (dtype attr)
 //   MATMUL_F16     F16 A and B (B stored (k,n) as is), F32 output
 //   ADD / MUL      C[m,n] = A[m,n] (+|*) B[m,n], F32
@@ -26,7 +28,7 @@
 //   SUB_ROW / DIV_ROW    C[m,n] = A[m,n] (-|/) B[m], F32
 //   CAST_F16       C[m,n] = F16(A[m,n]), A F32 (round to nearest even)
 enum ggml_xtc_kop {
-    XTC_KOP_MATMUL, XTC_KOP_MATMUL_F16_BT, XTC_KOP_MATMUL_F16, XTC_KOP_ADD, XTC_KOP_MUL, XTC_KOP_FMA,
+    XTC_KOP_MATMUL, XTC_KOP_MATMUL_KN, XTC_KOP_MATMUL_F16_BT, XTC_KOP_MATMUL_F16, XTC_KOP_ADD, XTC_KOP_MUL, XTC_KOP_FMA,
     XTC_KOP_RSQRT, XTC_KOP_SILU, XTC_KOP_CAST_F16, XTC_KOP_EXP,
     XTC_KOP_REDUCE_MAX, XTC_KOP_REDUCE_SUM, XTC_KOP_SUB_ROW, XTC_KOP_DIV_ROW,
 };

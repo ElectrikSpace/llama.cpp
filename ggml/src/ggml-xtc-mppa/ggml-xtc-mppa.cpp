@@ -169,6 +169,34 @@ static void * ggml_xtc_mppa_buffer_get_base(ggml_backend_buffer_t buffer) {
     return (void *) ((ggml_xtc_mppa_buffer *) buffer->context)->base;
 }
 
+// F32 model weights of a MUL_MAT are stored transposed on the device: (k, n) row-major instead of ggml's (n, k), the layout
+// the 8x8 microkernel needs for B. Applies to 2D weights of a WEIGHTS buffer (the 0-byte ANY buffer of the weight probe
+// takes the same kernels).
+static bool ggml_xtc_mppa_weight_kn(const struct ggml_tensor * w) {
+    if (w == nullptr || w->buffer == nullptr || w->type != GGML_TYPE_F32 || w->ne[2] != 1 || w->ne[3] != 1 ||
+        w->ne[0] < 2 || w->ne[1] < 2 || !ggml_is_contiguous(w)) {
+        return false;
+    }
+    const auto usage = ggml_backend_buffer_get_usage(w->buffer);
+    return usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+           (usage == GGML_BACKEND_BUFFER_USAGE_ANY && ggml_backend_buffer_get_size(w->buffer) == 0);
+}
+
+// dst (cols x rows) = transpose of src (rows x cols), both row-major
+static void ggml_xtc_mppa_transpose_f32(const float * src, float * dst, size_t rows, size_t cols) {
+    constexpr size_t B = 32;
+    for (size_t r0 = 0; r0 < rows; r0 += B) {
+        for (size_t c0 = 0; c0 < cols; c0 += B) {
+            const size_t r1 = std::min(r0 + B, rows), c1 = std::min(c0 + B, cols);
+            for (size_t r = r0; r < r1; r++) {
+                for (size_t c = c0; c < c1; c++) {
+                    dst[c * rows + r] = src[r * cols + c];
+                }
+            }
+        }
+    }
+}
+
 static void ggml_xtc_mppa_buffer_memset_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor,
                                                uint8_t value, size_t offset, size_t size) {
     const auto & rt = ggml_xtc_mppa_load_runtime();
@@ -185,6 +213,22 @@ static void ggml_xtc_mppa_buffer_set_tensor(ggml_backend_buffer_t buffer, struct
                                             const void * data, size_t offset, size_t size) {
     const auto & rt = ggml_xtc_mppa_load_runtime();
     auto * b = (ggml_xtc_mppa_buffer *) buffer->context;
+    if (ggml_xtc_mppa_weight_kn(tensor)) {
+        const size_t nbytes = ggml_nbytes(tensor);
+        const size_t dev_offset = ggml_xtc_mppa_device_offset(b, tensor, 0, nbytes);
+        std::vector<float> host(nbytes / sizeof(float));
+        if (offset != 0 || size != nbytes) {
+            // partial write: patch the host copy of the weight
+            ggml_backend_tensor_get(tensor, host.data(), 0, nbytes);
+            memcpy((char *) host.data() + offset, data, size);
+        } else {
+            memcpy(host.data(), data, size);
+        }
+        std::vector<float> kn(host.size());
+        ggml_xtc_mppa_transpose_f32(host.data(), kn.data(), tensor->ne[1], tensor->ne[0]);
+        GGML_ASSERT(ggml_xtc_mppa_h2d(rt, b->handle, kn.data(), dev_offset, nbytes));
+        return;
+    }
     const size_t dev_offset = ggml_xtc_mppa_device_offset(b, tensor, offset, size);
     GGML_ASSERT(ggml_xtc_mppa_h2d(rt, b->handle, const_cast<void *>(data), dev_offset, size));
 }
@@ -193,6 +237,15 @@ static void ggml_xtc_mppa_buffer_get_tensor(ggml_backend_buffer_t buffer, const 
                                             void * data, size_t offset, size_t size) {
     const auto & rt = ggml_xtc_mppa_load_runtime();
     auto * b = (ggml_xtc_mppa_buffer *) buffer->context;
+    if (ggml_xtc_mppa_weight_kn(tensor)) {
+        const size_t nbytes = ggml_nbytes(tensor);
+        const size_t dev_offset = ggml_xtc_mppa_device_offset(b, tensor, 0, nbytes);
+        std::vector<float> kn(nbytes / sizeof(float)), host(nbytes / sizeof(float));
+        GGML_ASSERT(ggml_xtc_mppa_d2h(rt, b->handle, kn.data(), dev_offset, nbytes));
+        ggml_xtc_mppa_transpose_f32(kn.data(), host.data(), tensor->ne[0], tensor->ne[1]);
+        memcpy(data, (const char *) host.data() + offset, size);
+        return;
+    }
     const size_t dev_offset = ggml_xtc_mppa_device_offset(b, tensor, offset, size);
     GGML_ASSERT(ggml_xtc_mppa_d2h(rt, b->handle, data, dev_offset, size));
 }
@@ -504,7 +557,14 @@ static bool ggml_xtc_mppa_has_runner(const struct ggml_tensor * op) {
 // Kernels of a node: those of its F16 flavour, else the F32 ones
 static std::vector<ggml_xtc_kernel_shape> ggml_xtc_mppa_node_kernels(const struct ggml_tensor * op) {
     std::vector<ggml_xtc_kernel_shape> shapes = ggml_xtc_node_kernels_f16(op);
-    return shapes.empty() ? ggml_xtc_node_kernels(op) : shapes;
+    if (!shapes.empty()) {
+        return shapes;
+    }
+    shapes = ggml_xtc_node_kernels(op);
+    if (op->op == GGML_OP_MUL_MAT && !shapes.empty() && shapes[0].kop == XTC_KOP_MATMUL && ggml_xtc_mppa_weight_kn(op->src[0])) {
+        shapes[0].kop = XTC_KOP_MATMUL_KN;
+    }
+    return shapes;
 }
 
 // F16 flavour of a node (F16 activations): its kernels and runners work on 2-byte elements
