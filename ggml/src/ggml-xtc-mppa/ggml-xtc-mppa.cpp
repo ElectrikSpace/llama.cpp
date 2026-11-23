@@ -11,6 +11,8 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
+#include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <initializer_list>
@@ -37,6 +39,38 @@ static constexpr int    GGML_XTC_MPPA_MEMORY_KIND_GLOBAL = 0;
 static constexpr size_t GGML_XTC_MPPA_ALIGNMENT          = 64;
 static constexpr size_t GGML_XTC_MPPA_CHUNK              = 1 << 20;
 
+// Profiling: GGML_XTC_MPPA_PROFILE=<file> appends one CSV line per kernel call (device MPPA) and per host<->device
+// transfer. The scheduler (ggml-backend.cpp) appends one line per split to the same file.
+struct ggml_xtc_mppa_profile {
+    FILE *       f = nullptr;
+    std::string  node;   // node being executed, empty outside of graph_compute (scheduler inputs/outputs)
+    const char * op       = "";
+    int          node_idx = -1;
+    uint64_t     graph    = 0;
+    uint64_t     seq      = 0;
+    ggml_xtc_mppa_profile() {
+        const char * path = getenv("GGML_XTC_MPPA_PROFILE");
+        if (path != nullptr && path[0] != '\0') {
+            f = fopen(path, "a");
+            if (f && ftell(f) == 0) {
+                fprintf(f, "seq,graph,kind,device,node_idx,op,node,kernel_key,bytes,time_us\n");
+                fflush(f);
+            }
+        }
+    }
+    ~ggml_xtc_mppa_profile() {
+        if (f) {
+            fclose(f);
+        }
+    }
+    void log(const char * kind, const char * device, const char * key, size_t bytes, double us) {
+        fprintf(f, "%llu,%llu,%s,%s,%d,%s,\"%s\",%s,%zu,%.3f\n", (unsigned long long) seq++, (unsigned long long) graph,
+                kind, device, node_idx, op, node.c_str(), key, bytes, us);
+        fflush(f);
+    }
+};
+static ggml_xtc_mppa_profile g_xtc_mppa_profile;
+
 struct ggml_xtc_mppa_runtime {
     bool (*init_device)(void);
     void * (*create_memory_handle)(void);
@@ -56,6 +90,27 @@ static Fn ggml_xtc_mppa_sym(void * lib, const char * name) {
         GGML_ABORT("ggml-xtc-mppa: symbol %s not found: %s", name, dlerror());
     }
     return reinterpret_cast<Fn>(sym);
+}
+
+// host <-> device copies, timed when profiling
+static bool ggml_xtc_mppa_h2d(const ggml_xtc_mppa_runtime & rt, void * handle, void * host, size_t off, size_t bytes) {
+    if (!g_xtc_mppa_profile.f) {
+        return rt.memory_copy_to_offset(handle, host, off, bytes);
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool ok = rt.memory_copy_to_offset(handle, host, off, bytes);
+    g_xtc_mppa_profile.log("h2d", "HOST->MPPA", "", bytes, std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
+    return ok;
+}
+
+static bool ggml_xtc_mppa_d2h(const ggml_xtc_mppa_runtime & rt, void * handle, void * host, size_t off, size_t bytes) {
+    if (!g_xtc_mppa_profile.f) {
+        return rt.memory_copy_from_offset(handle, host, off, bytes);
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool ok = rt.memory_copy_from_offset(handle, host, off, bytes);
+    g_xtc_mppa_profile.log("d2h", "MPPA->HOST", "", bytes, std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
+    return ok;
 }
 
 static const ggml_xtc_mppa_runtime & ggml_xtc_mppa_load_runtime() {
@@ -122,7 +177,7 @@ static void ggml_xtc_mppa_buffer_memset_tensor(ggml_backend_buffer_t buffer, str
     std::vector<uint8_t> chunk(std::min(size, GGML_XTC_MPPA_CHUNK), value);
     for (size_t done = 0; done < size; done += chunk.size()) {
         const size_t n = std::min(chunk.size(), size - done);
-        GGML_ASSERT(rt.memory_copy_to_offset(b->handle, chunk.data(), dev_offset + done, n));
+        GGML_ASSERT(ggml_xtc_mppa_h2d(rt, b->handle, chunk.data(), dev_offset + done, n));
     }
 }
 
@@ -131,7 +186,7 @@ static void ggml_xtc_mppa_buffer_set_tensor(ggml_backend_buffer_t buffer, struct
     const auto & rt = ggml_xtc_mppa_load_runtime();
     auto * b = (ggml_xtc_mppa_buffer *) buffer->context;
     const size_t dev_offset = ggml_xtc_mppa_device_offset(b, tensor, offset, size);
-    GGML_ASSERT(rt.memory_copy_to_offset(b->handle, const_cast<void *>(data), dev_offset, size));
+    GGML_ASSERT(ggml_xtc_mppa_h2d(rt, b->handle, const_cast<void *>(data), dev_offset, size));
 }
 
 static void ggml_xtc_mppa_buffer_get_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor,
@@ -139,7 +194,7 @@ static void ggml_xtc_mppa_buffer_get_tensor(ggml_backend_buffer_t buffer, const 
     const auto & rt = ggml_xtc_mppa_load_runtime();
     auto * b = (ggml_xtc_mppa_buffer *) buffer->context;
     const size_t dev_offset = ggml_xtc_mppa_device_offset(b, tensor, offset, size);
-    GGML_ASSERT(rt.memory_copy_from_offset(b->handle, data, dev_offset, size));
+    GGML_ASSERT(ggml_xtc_mppa_d2h(rt, b->handle, data, dev_offset, size));
 }
 
 // the source is copied through the host: the MPPA runtime has no device to device copy yet
@@ -162,7 +217,7 @@ static void ggml_xtc_mppa_buffer_clear(ggml_backend_buffer_t buffer, uint8_t val
     std::vector<uint8_t> chunk(std::min(b->size, GGML_XTC_MPPA_CHUNK), value);
     for (size_t done = 0; done < b->size; done += chunk.size()) {
         const size_t n = std::min(chunk.size(), b->size - done);
-        GGML_ASSERT(rt.memory_copy_to_offset(b->handle, chunk.data(), done, n));
+        GGML_ASSERT(ggml_xtc_mppa_h2d(rt, b->handle, chunk.data(), done, n));
     }
 }
 
@@ -246,7 +301,7 @@ static void ggml_xtc_mppa_tensor_read(const struct ggml_tensor * t, size_t byte_
     const auto & rt = ggml_xtc_mppa_load_runtime();
     auto * b = (ggml_xtc_mppa_buffer *) t->buffer->context;
     const size_t dev_offset = ggml_xtc_mppa_device_offset(b, t, byte_off, bytes);
-    GGML_ASSERT(rt.memory_copy_from_offset(b->handle, host, dev_offset, bytes));
+    GGML_ASSERT(ggml_xtc_mppa_d2h(rt, b->handle, host, dev_offset, bytes));
 }
 
 static void ggml_xtc_mppa_tensor_write(struct ggml_tensor * t, size_t byte_off, const void * host,
@@ -255,7 +310,7 @@ static void ggml_xtc_mppa_tensor_write(struct ggml_tensor * t, size_t byte_off, 
     const auto & rt = ggml_xtc_mppa_load_runtime();
     auto * b = (ggml_xtc_mppa_buffer *) t->buffer->context;
     const size_t dev_offset = ggml_xtc_mppa_device_offset(b, t, byte_off, bytes);
-    GGML_ASSERT(rt.memory_copy_to_offset(b->handle, const_cast<void *>(host), dev_offset, bytes));
+    GGML_ASSERT(ggml_xtc_mppa_h2d(rt, b->handle, const_cast<void *>(host), dev_offset, bytes));
 }
 
 static size_t ggml_xtc_mppa_align(size_t bytes) {
@@ -326,13 +381,13 @@ struct ggml_xtc_mppa_context {
     // host to device at an existing scratch address
     void write(uintptr_t dev, const void * host, size_t bytes) {
         const auto & rt = ggml_xtc_mppa_load_runtime();
-        GGML_ASSERT(rt.memory_copy_to_offset(handle, const_cast<void *>(host), dev_offset(dev, bytes), bytes));
+        GGML_ASSERT(ggml_xtc_mppa_h2d(rt, handle, const_cast<void *>(host), dev_offset(dev, bytes), bytes));
     }
 
     // device to host from an existing scratch address
     void download(uintptr_t dev, void * host, size_t bytes) const {
         const auto & rt = ggml_xtc_mppa_load_runtime();
-        GGML_ASSERT(rt.memory_copy_from_offset(handle, host, dev_offset(dev, bytes), bytes));
+        GGML_ASSERT(ggml_xtc_mppa_d2h(rt, handle, host, dev_offset(dev, bytes), bytes));
     }
 
 private:
@@ -350,6 +405,7 @@ struct ggml_xtc_mppa_kernel {
     void *             lib      = nullptr;
     ggml_xtc_kernel_fn fn       = nullptr;
     uint64_t           last_use = 0;
+    std::string        key;
 };
 
 // protects the kernel table and the graph generation: held by graph_compute
@@ -423,6 +479,7 @@ static const ggml_xtc_mppa_kernel * ggml_xtc_mppa_get_kernel(const ggml_xtc_kern
     k.lib      = lib;
     k.fn       = fn;
     k.last_use = g_xtc_mppa_generation;
+    k.key      = key;
     return &g_xtc_mppa_kernels.emplace(key, k).first->second;
 }
 
@@ -476,11 +533,16 @@ static void ggml_xtc_mppa_invoke(const ggml_xtc_mppa_kernel & k, std::initialize
     for (const uintptr_t a : args) {
         p[n++] = (void *) a;
     }
+    const auto t0 = std::chrono::steady_clock::now();
     switch (n) {
         case 2: ((void (*)(void *, void *)) k.fn)(p[0], p[1]); break;
         case 3: k.fn(p[0], p[1], p[2]); break;
         case 4: ((void (*)(void *, void *, void *, void *)) k.fn)(p[0], p[1], p[2], p[3]); break;
         default: GGML_ABORT("%s: unexpected arity %zu", __func__, n);
+    }
+    if (g_xtc_mppa_profile.f) {
+        g_xtc_mppa_profile.log("kernel", "MPPA", k.key.c_str(), 0,
+                               std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
     }
 }
 
@@ -977,6 +1039,7 @@ static void ggml_xtc_mppa_run_flash_attn_f16(ggml_xtc_mppa_context & ctx, const 
 static enum ggml_status ggml_backend_xtc_mppa_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     std::lock_guard<std::mutex> lock(g_xtc_mppa_mutex);
     g_xtc_mppa_generation++;
+    g_xtc_mppa_profile.graph = g_xtc_mppa_generation;
     auto & ctx = *static_cast<ggml_xtc_mppa_context *>(backend->context);
     ctx.reset();
 
@@ -1024,6 +1087,9 @@ static enum ggml_status ggml_backend_xtc_mppa_graph_compute(ggml_backend_t backe
         if (fns[i].empty()) {
             continue;
         }
+        g_xtc_mppa_profile.node     = node->name;
+        g_xtc_mppa_profile.op       = ggml_op_name(node->op);
+        g_xtc_mppa_profile.node_idx = i;
         switch (node->op) {
             case GGML_OP_MUL_MAT:
                 ggml_xtc_mppa_run_matmul(ctx, fns[i], node);
@@ -1058,6 +1124,9 @@ static enum ggml_status ggml_backend_xtc_mppa_graph_compute(ggml_backend_t backe
                 GGML_ABORT("%s: unexpected op %s", __func__, ggml_op_name(node->op));
         }
     }
+    g_xtc_mppa_profile.node.clear();
+    g_xtc_mppa_profile.op       = "";
+    g_xtc_mppa_profile.node_idx = -1;
 
     return GGML_STATUS_SUCCESS;
 }

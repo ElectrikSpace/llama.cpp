@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -2122,9 +2123,26 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     }
 }
 
+// split profiling (shared CSV with ggml-xtc-mppa): GGML_XTC_MPPA_PROFILE=<file>
+static FILE * ggml_sched_profile_file() {
+    static FILE * f = [] {
+        const char * path = getenv("GGML_XTC_MPPA_PROFILE");
+        FILE * r = (path != nullptr && path[0] != '\0') ? fopen(path, "a") : nullptr;
+        if (r && ftell(r) == 0) {
+            fprintf(r, "seq,graph,kind,device,node_idx,op,node,kernel_key,bytes,time_us\n");
+            fflush(r);
+        }
+        return r;
+    }();
+    return f;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
+    static uint64_t sched_graph_id = 0;
+    sched_graph_id++;
+    FILE * prof = ggml_sched_profile_file();
 
     int prev_backend_id = -1;
 
@@ -2157,9 +2175,28 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         if (!sched->callback_eval) {
+            const int64_t prof_t0 = prof ? ggml_time_us() : 0;
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
+            }
+            if (prof) {
+                ggml_backend_synchronize(split_backend);
+                size_t in_bytes = 0;
+                for (int i = 0; i < split->n_inputs; i++) {
+                    in_bytes += ggml_nbytes(split->inputs[i]);
+                }
+                std::string ops;
+                for (int i = 0; i < split->graph.n_nodes; i++) {
+                    if (i > 0) {
+                        ops += '+';
+                    }
+                    ops += ggml_op_name(split->graph.nodes[i]->op);
+                }
+                fprintf(prof, ",%llu,split,%s,%d,%s,\"%d nodes\",,%zu,%.3f\n", (unsigned long long) sched_graph_id,
+                        ggml_backend_name(split_backend), split_id, ops.c_str(), split->graph.n_nodes, in_bytes,
+                        (double) (ggml_time_us() - prof_t0));
+                fflush(prof);
             }
         } else {
             // similar to ggml_backend_compare_graph_backend
