@@ -609,10 +609,19 @@ static void ggml_xtc_mppa_invoke(const ggml_xtc_mppa_kernel & k, std::initialize
 // C[m,n] = A[m,k] x B[k,n] per slice, like ggml_xtc_run_mul_mat_kernel but on device addresses
 static void ggml_xtc_mppa_run_matmul(ggml_xtc_mppa_context & ctx, const std::vector<const ggml_xtc_mppa_kernel *> & fns,
                                      struct ggml_tensor * dst) {
-    GGML_UNUSED(ctx);
-    const ggml_xtc_mppa_kernel & k = *fns[0];
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
+    // F16 weight with a F32 input: the input is first cast to F16 (fns[0]), then the F16 x F16 -> F32 matmul (fns[1])
+    const bool cast_in = fns.size() == 2;
+    const ggml_xtc_mppa_kernel & k = *fns[fns.size() - 1];
+    uintptr_t a16 = 0;
+    if (cast_in) {
+        const size_t bytes = ggml_nelements(src1) * sizeof(ggml_fp16_t);
+        ctx.reset();
+        ctx.reserve(ggml_xtc_mppa_align(bytes));
+        a16 = ctx.alloc(bytes);
+        ggml_xtc_mppa_invoke(*fns[0], { ggml_xtc_mppa_dev_addr(src1), a16 });
+    }
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -624,7 +633,7 @@ static void ggml_xtc_mppa_run_matmul(ggml_xtc_mppa_context & ctx, const std::vec
             const int64_t i03 = i13 / r3;
             const int64_t i02 = i12 / r2;
 
-            const uintptr_t a = ggml_xtc_mppa_dev_addr(src1, i12 * nb12 + i13 * nb13);
+            const uintptr_t a = cast_in ? a16 : ggml_xtc_mppa_dev_addr(src1, i12 * nb12 + i13 * nb13);
             const uintptr_t b = ggml_xtc_mppa_dev_addr(src0, i02 * nb02 + i03 * nb03);
             const uintptr_t c = ggml_xtc_mppa_dev_addr(dst, i12 * nb2 + i13 * nb3);
             ggml_xtc_mppa_invoke(k, { a, b, c });

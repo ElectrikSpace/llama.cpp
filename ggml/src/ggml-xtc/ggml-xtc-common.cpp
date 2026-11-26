@@ -635,13 +635,20 @@ std::vector<ggml_xtc_kernel_shape> ggml_xtc_node_kernels_f16(const struct ggml_t
 
     switch (op->op) {
         case GGML_OP_MUL_MAT:
-            // F16 weight x F16 input -> F32 output: the F16 x F16 -> F32 kernel, B (the weight) transposed
-            if (src0->type == GGML_TYPE_F16 && src1 != nullptr && src1->type == GGML_TYPE_F16 &&
+            // F16 weight x F16 input -> F32 output: the F16 x F16 -> F32 kernel, B (the weight) transposed.
+            // F32 input (F16 model, F32 activations): the same after a F32 -> F16 cast of the input (one 2D slice).
+            if (src0->type == GGML_TYPE_F16 && src1 != nullptr && (src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_F32) &&
                 op->type == GGML_TYPE_F32 && src0->buffer != nullptr &&
-                ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+                 (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_ANY &&
+                  ggml_backend_buffer_get_size(src0->buffer) == 0)) &&
                 ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(op) &&
                 ggml_nelements(op) > 0 && ggml_nelements(src0) > 0 && ggml_nelements(src1) > 0 &&
-                src1->ne[2] % src0->ne[2] == 0 && src1->ne[3] % src0->ne[3] == 0) {
+                src1->ne[2] % src0->ne[2] == 0 && src1->ne[3] % src0->ne[3] == 0 &&
+                (src1->type == GGML_TYPE_F16 || (src1->ne[2] == 1 && src1->ne[3] == 1))) {
+                if (src1->type == GGML_TYPE_F32) {
+                    out.push_back(k(XTC_KOP_CAST_F16, src1->ne[1], src1->ne[0], 0, false));
+                }
                 out.push_back(k(XTC_KOP_MATMUL_F16_BT, src1->ne[1], src0->ne[1], src0->ne[0], false));
             }
             break;
